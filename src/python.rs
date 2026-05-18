@@ -594,12 +594,10 @@ macro_rules! define_map_classes {
                 if self.inner.is_empty() {
                     return Err(PyKeyError::new_err("popitem(): map is empty"));
                 }
-                let probe = {
-                    let (k, _) = self.inner.iter().next().expect("len > 0");
-                    k.clone_with_py(py)
+                let (key_obj, value) = {
+                    let (k, v) = self.inner.extract_if(|_, _| true).next().expect("len > 0");
+                    (k.obj_clone_ref(py), v)
                 };
-                let key_obj = probe.obj_clone_ref(py);
-                let value = self.inner.remove(&probe).expect("key from iter must exist");
                 self.bump();
                 PyTuple::new(py, [key_obj, value])
             }
