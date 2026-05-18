@@ -13,7 +13,7 @@ Both are open-addressing hash maps that achieve optimal expected probe complexit
 
 ## Data Structures
 
-Both maps share a common core: `RawTable`-backed multi-level layouts, 7-bit fingerprint control bytes, SIMD control-byte scans for occupancy + lookup, tombstone accounting, and SwissTable-style triangular probing within every level [^swisstable] [^cppcon2017] [^hashbrown]. Per-level `group_count` is rounded up to a power of two so `(idx + delta) & mask` wraps in one op. Per-level salt re-randomization [^cw1979] decorrelates probe paths across levels. Funnel's special-primary probe issues an intra-loop prefetch one group ahead [^prefetch2007]; bucket selection uses Lemire fastmod [^fastmod] to skip the hardware divide. The default `BuildHasher` is [`foldhash`](https://crates.io/crates/foldhash) [^foldhash].
+Both maps share a common core: `RawTable`-backed multi-level layouts, 7-bit fingerprint control bytes, SIMD control-byte scans for occupancy + lookup, tombstone accounting, and SwissTable-style triangular probing within every level [^swisstable] [^cppcon2017] [^hashbrown]. Per-level salt re-randomization [^cw1979] decorrelates probe paths across levels. Funnel's special-primary probe issues an intra-loop prefetch one group ahead [^prefetch2007]; bucket selection uses Lemire fastmod [^fastmod] to skip the hardware divide. The default `BuildHasher` is [`foldhash`](https://crates.io/crates/foldhash) [^foldhash].
 
 - **`ElasticHashMap<K, V>`** — Flat `RawTable` per level with geometrically halving capacities; insertion uses per-level probe budgets.
 - **`FunnelHashMap<K, V>`** — Bucketed levels plus a split special array: `primary` (group-probed) and `fallback` (two-choice buckets).
