@@ -14,7 +14,7 @@ use crate::common::control::{CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte, ControlOps
 use crate::common::entry::{EntryView, OccupiedError as CommonOccupiedError};
 use crate::common::iter::{
     IntoKeys as CommonIntoKeys, IntoValues as CommonIntoValues, Keys as CommonKeys,
-    Values as CommonValues,
+    OccupiedScanner, Values as CommonValues,
 };
 use crate::common::layout::{Entry as SlotEntry, GROUP_SIZE, RawTable};
 use crate::common::math::{
@@ -725,7 +725,7 @@ where
         ElasticIter {
             levels: &self.levels,
             level_idx: 0,
-            slot_idx: 0,
+            scanner: OccupiedScanner::new(),
         }
     }
 
@@ -755,7 +755,7 @@ where
             levels,
             levels_len,
             level_idx: 0,
-            slot_idx: 0,
+            scanner: OccupiedScanner::new(),
             _marker: PhantomData,
         }
     }
@@ -871,7 +871,7 @@ where
         Drain {
             map: self,
             level_idx: 0,
-            slot_idx: 0,
+            scanner: OccupiedScanner::new(),
         }
     }
 
@@ -886,7 +886,7 @@ where
             map: self,
             pred: f,
             level_idx: 0,
-            slot_idx: 0,
+            scanner: OccupiedScanner::new(),
         }
     }
 
@@ -1135,7 +1135,7 @@ where
 pub struct Drain<'a, K, V, S = DefaultHashBuilder, A: Allocator + Clone = Global> {
     map: &'a mut ElasticHashMap<K, V, S, A>,
     level_idx: usize,
-    slot_idx: usize,
+    scanner: OccupiedScanner,
 }
 
 impl<K: fmt::Debug, V: fmt::Debug, S, A: Allocator + Clone> fmt::Debug for Drain<'_, K, V, S, A> {
@@ -1148,22 +1148,18 @@ impl<K, V, S, A: Allocator + Clone> Iterator for Drain<'_, K, V, S, A> {
     type Item = (K, V);
 
     fn next(&mut self) -> Option<Self::Item> {
+        // Per-yield ctrl byte update is skipped: Drain::drop wipes all ctrls
+        // via `clear_all_controls` regardless, and the scanner only advances
+        // forward so yielded slots are never re-read.
         while self.level_idx < self.map.levels.len() {
             let level = &mut self.map.levels[self.level_idx];
-            while self.slot_idx < level.table.capacity() {
-                let idx = self.slot_idx;
-                self.slot_idx += 1;
-                if level.table.control_at(idx).is_occupied() {
-                    let entry = unsafe { level.table.take(idx) };
-                    level.table.mark_tombstone(idx);
-                    level.len -= 1;
-                    level.tombstones += 1;
-                    self.map.len -= 1;
-                    return Some((entry.key, entry.value));
-                }
+            if let Some(idx) = self.scanner.next_in(&level.table) {
+                let entry = unsafe { level.table.take(idx) };
+                self.map.len -= 1;
+                return Some((entry.key, entry.value));
             }
             self.level_idx += 1;
-            self.slot_idx = 0;
+            self.scanner.reset();
         }
         None
     }
@@ -1205,7 +1201,7 @@ where
     map: &'a mut ElasticHashMap<K, V, S, A>,
     pred: F,
     level_idx: usize,
-    slot_idx: usize,
+    scanner: OccupiedScanner,
 }
 
 impl<K, V, F, S, A: Allocator + Clone> fmt::Debug for ExtractIf<'_, K, V, F, S, A>
@@ -1230,12 +1226,7 @@ where
     fn next(&mut self) -> Option<Self::Item> {
         while self.level_idx < self.map.levels.len() {
             let level = &mut self.map.levels[self.level_idx];
-            while self.slot_idx < level.table.capacity() {
-                let idx = self.slot_idx;
-                self.slot_idx += 1;
-                if !level.table.control_at(idx).is_occupied() {
-                    continue;
-                }
+            while let Some(idx) = self.scanner.next_in(&level.table) {
                 // In-place borrow so predicate mutations stick on kept entries.
                 let entry = unsafe { level.table.get_mut(idx) };
                 if (self.pred)(&entry.key, &mut entry.value) {
@@ -1248,7 +1239,7 @@ where
                 }
             }
             self.level_idx += 1;
-            self.slot_idx = 0;
+            self.scanner.reset();
         }
         None
     }
@@ -1271,20 +1262,19 @@ where
     }
 }
 
-/// Borrowing iterator over occupied entries. Walks levels in order, scanning
-/// each level's slot array linearly. Skips FREE and TOMBSTONE control bytes.
+/// Borrowing iterator over occupied entries. Walks levels in order via
+/// [`OccupiedScanner`]; skips FREE and TOMBSTONE.
 #[derive(Clone)]
 pub struct ElasticIter<'a, K, V, A: Allocator + Clone = Global> {
     levels: &'a [Level<K, V, A>],
     level_idx: usize,
-    slot_idx: usize,
+    scanner: OccupiedScanner,
 }
 
 impl<K, V, A: Allocator + Clone> fmt::Debug for ElasticIter<'_, K, V, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ElasticIter")
             .field("level_idx", &self.level_idx)
-            .field("slot_idx", &self.slot_idx)
             .finish_non_exhaustive()
     }
 }
@@ -1294,17 +1284,13 @@ impl<'a, K, V, A: Allocator + Clone> Iterator for ElasticIter<'a, K, V, A> {
 
     fn next(&mut self) -> Option<Self::Item> {
         while self.level_idx < self.levels.len() {
-            let level = &self.levels[self.level_idx];
-            while self.slot_idx < level.table.capacity() {
-                let idx = self.slot_idx;
-                self.slot_idx += 1;
-                if level.table.control_at(idx).is_occupied() {
-                    let entry = unsafe { level.table.get_ref(idx) };
-                    return Some((&entry.key, &entry.value));
-                }
+            let table = &self.levels[self.level_idx].table;
+            if let Some(slot_idx) = self.scanner.next_in(table) {
+                let entry = unsafe { table.get_ref(slot_idx) };
+                return Some((&entry.key, &entry.value));
             }
             self.level_idx += 1;
-            self.slot_idx = 0;
+            self.scanner.reset();
         }
         None
     }
@@ -1341,7 +1327,7 @@ pub struct ElasticIterMut<'a, K, V, A: Allocator + Clone = Global> {
     levels: *mut Level<K, V, A>,
     levels_len: usize,
     level_idx: usize,
-    slot_idx: usize,
+    scanner: OccupiedScanner,
     _marker: PhantomData<&'a mut [Level<K, V, A>]>,
 }
 
@@ -1357,22 +1343,16 @@ impl<'a, K, V, A: Allocator + Clone> Iterator for ElasticIterMut<'a, K, V, A> {
             // SAFETY: `level_idx < levels_len`; `self.levels` points at an
             // owned slice of initialized `Level`s. Fresh `&mut` each iter.
             let level = unsafe { &mut *self.levels.add(self.level_idx) };
-            let cap = level.table.capacity();
-            while self.slot_idx < cap {
-                let idx = self.slot_idx;
-                self.slot_idx += 1;
-                if level.table.control_at(idx).is_occupied() {
-                    // SAFETY: occupied control byte ⇒ valid Entry. Reborrow
-                    // through raw ptr so returned refs outlive the per-iter
-                    // `level` reborrow; never revisit the slot ⇒ disjoint.
-                    let entry = unsafe { level.table.get_mut(idx) };
-                    let key: &'a K = unsafe { &*ptr::from_ref(&entry.key) };
-                    let val: &'a mut V = unsafe { &mut *ptr::from_mut(&mut entry.value) };
-                    return Some((key, val));
-                }
+            if let Some(idx) = self.scanner.next_in(&level.table) {
+                // SAFETY: scanner only yields occupied slots; reborrow through
+                // raw ptr so refs outlive the per-iter `level` reborrow.
+                let entry = unsafe { level.table.get_mut(idx) };
+                let key: &'a K = unsafe { &*ptr::from_ref(&entry.key) };
+                let val: &'a mut V = unsafe { &mut *ptr::from_mut(&mut entry.value) };
+                return Some((key, val));
             }
             self.level_idx += 1;
-            self.slot_idx = 0;
+            self.scanner.reset();
         }
         None
     }
@@ -1382,7 +1362,6 @@ impl<K, V, A: Allocator + Clone> fmt::Debug for ElasticIterMut<'_, K, V, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ElasticIterMut")
             .field("level_idx", &self.level_idx)
-            .field("slot_idx", &self.slot_idx)
             .finish_non_exhaustive()
     }
 }
@@ -1418,7 +1397,6 @@ impl<K, V, A: Allocator + Clone> fmt::Debug for ElasticValuesMut<'_, K, V, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ElasticValuesMut")
             .field("level_idx", &self.inner.level_idx)
-            .field("slot_idx", &self.inner.slot_idx)
             .finish_non_exhaustive()
     }
 }
@@ -1427,7 +1405,7 @@ impl<K, V, A: Allocator + Clone> fmt::Debug for ElasticValuesMut<'_, K, V, A> {
 pub struct ElasticIntoIter<K, V, S = DefaultHashBuilder, A: Allocator + Clone = Global> {
     map: ElasticHashMap<K, V, S, A>,
     level_idx: usize,
-    slot_idx: usize,
+    scanner: OccupiedScanner,
 }
 
 impl<K, V, S, A: Allocator + Clone> Iterator for ElasticIntoIter<K, V, S, A> {
@@ -1435,21 +1413,16 @@ impl<K, V, S, A: Allocator + Clone> Iterator for ElasticIntoIter<K, V, S, A> {
 
     fn next(&mut self) -> Option<Self::Item> {
         while self.level_idx < self.map.levels.len() {
-            let level = &mut self.map.levels[self.level_idx];
-            let cap = level.table.capacity();
-            while self.slot_idx < cap {
-                let idx = self.slot_idx;
-                self.slot_idx += 1;
-                if level.table.control_at(idx).is_occupied() {
-                    // SAFETY: occupied ⇒ valid. Tombstone-mark prevents
-                    // map's Drop and future next() from revisiting.
-                    let entry = unsafe { level.table.take(idx) };
-                    level.table.mark_tombstone(idx);
-                    return Some((entry.key, entry.value));
-                }
+            let table = &mut self.map.levels[self.level_idx].table;
+            if let Some(idx) = self.scanner.next_in(table) {
+                // SAFETY: scanner only yields occupied slots. Tombstone-mark
+                // prevents map's Drop and future next() from revisiting.
+                let entry = unsafe { table.take(idx) };
+                table.mark_tombstone(idx);
+                return Some((entry.key, entry.value));
             }
             self.level_idx += 1;
-            self.slot_idx = 0;
+            self.scanner.reset();
         }
         None
     }
@@ -1469,7 +1442,6 @@ impl<K, V, S, A: Allocator + Clone> fmt::Debug for ElasticIntoIter<K, V, S, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ElasticIntoIter")
             .field("level_idx", &self.level_idx)
-            .field("slot_idx", &self.slot_idx)
             .finish_non_exhaustive()
     }
 }
@@ -1487,7 +1459,7 @@ where
         ElasticIntoIter {
             map: self,
             level_idx: 0,
-            slot_idx: 0,
+            scanner: OccupiedScanner::new(),
         }
     }
 }
@@ -1658,6 +1630,7 @@ where
     /// batch-targeted level pair first (`choose_slot_targeted`); falls back
     /// to a full sweep across all levels when the targeted slot is full
     /// (e.g. tombstones in earlier levels are the only reusable slots).
+    #[inline]
     fn choose_slot_for_new_key(&mut self, key_hash: u64) -> Option<(usize, usize)> {
         if self.levels.is_empty() {
             return None;
@@ -1680,6 +1653,7 @@ where
     /// `current_free_slots > half_reserve_threshold` and `next_free_slots`
     /// thresholds. Per the elastic-hashing schedule, this is what keeps
     /// expected probe count low at high load.
+    #[inline]
     fn choose_slot_targeted(&self, key_hash: u64) -> Option<(usize, usize)> {
         if self.current_batch_index == 0 {
             return self
@@ -1778,7 +1752,6 @@ where
 
         let group_count = level.table.group_count();
         let mask = level.group_count_mask;
-        let capacity = level.capacity();
         let mut group_idx = Self::triangular_group_start(level, key_hash);
         let mut delta: usize = 0;
 
@@ -1791,10 +1764,7 @@ where
                     return Some(slot_idx);
                 }
             }
-            let empty_mask = level.table.group_match_mask(group_idx, CTRL_EMPTY);
-            if let Some(off) = empty_mask.lowest()
-                && group_idx * GROUP_SIZE + off < capacity
-            {
+            if level.table.group_match_mask(group_idx, CTRL_EMPTY).any() {
                 return None;
             }
             delta += 1;
@@ -1806,6 +1776,7 @@ where
     /// Probe-bounded variant of `first_free_uniform`: scans at most
     /// `max_groups` groups. Used by the elastic schedule when
     /// `current_level` still has reserve headroom.
+    #[inline]
     fn first_free_limited(
         &self,
         key_hash: u64,
@@ -1834,6 +1805,7 @@ where
 
     /// Triangular scan over all groups for the first FREE-or-TOMBSTONE slot.
     /// Returns `None` only if the level is completely OCCUPIED.
+    #[inline]
     fn first_free_uniform(&self, key_hash: u64, level_idx: usize) -> Option<usize> {
         let level = &self.levels[level_idx];
         if level.len >= level.capacity() {

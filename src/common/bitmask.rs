@@ -10,6 +10,7 @@ pub(crate) const BITMASK_STRIDE: u32 = 1;
 
 /// Per-slot match mask over a control group. `u16` on `x86_64` (1 bit/slot),
 /// `u64` on `aarch64` (4 bits/slot — native `vshrn_n_u16` output).
+#[derive(Clone, Copy)]
 pub(crate) struct BitMask(pub(crate) BitMaskWord);
 
 impl BitMask {
@@ -43,10 +44,8 @@ impl BitMask {
     }
 }
 
-// `BitMask` is consumed by iteration (bits cleared as yielded). Copy is used
-// intentionally so callers can pass/store masks by value without worrying
-// about ownership. Consuming iteration on a Copy type is safe because the
-// mask snapshot is frozen at call site.
+// BitMask is Copy intentionally — callers snapshot the mask at a call site
+// and consume bits via this Iterator without worrying about borrow scope.
 #[allow(clippy::copy_iterator)]
 impl Iterator for BitMask {
     type Item = usize;
