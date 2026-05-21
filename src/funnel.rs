@@ -4,7 +4,7 @@ use std::hash::{BuildHasher, Hash};
 use std::iter::FusedIterator;
 use std::marker::PhantomData;
 use std::mem;
-use std::ops::Range;
+use std::ops::{ControlFlow, Range};
 use std::ptr;
 
 use allocator_api2::boxed::Box as ABox;
@@ -2009,25 +2009,63 @@ where
         K: Borrow<Q>,
         Q: Eq + ?Sized,
     {
-        let search_limit = (self.max_populated_level + 1).min(self.levels.len());
-        for (level_idx, level) in self.levels[..search_limit].iter().enumerate() {
-            match Self::find_in_level_bucket(key_hash, key_fingerprint, key, level) {
+        if let Some(level0) = self.levels.first() {
+            match Self::find_in_level_bucket(key_hash, key_fingerprint, key, level0) {
                 LookupStep::Found(slot_idx) => {
                     return Some(SlotLocation::Level {
-                        level_idx,
+                        level_idx: 0,
                         slot_idx,
                     });
                 }
                 LookupStep::Continue => {}
                 LookupStep::StopSearch => return None,
             }
+        } else {
+            return None;
         }
 
-        // Cold path — only reached when overflow forced keys into the special tables
+        // L1+ is empty in steady state at default load; outline only when populated.
+        if self.max_populated_level > 0
+            && let ControlFlow::Break(result) =
+                self.find_in_higher_levels(key, key_hash, key_fingerprint)
+        {
+            return result;
+        }
+
+        // Special tables — only populated under overflow.
         if self.special.primary.len == 0 && self.special.fallback.len == 0 {
             return None;
         }
+
         self.find_in_special_outline(key_hash, key_fingerprint, key)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn find_in_higher_levels<Q>(
+        &self,
+        key: &Q,
+        key_hash: u64,
+        key_fingerprint: u8,
+    ) -> ControlFlow<Option<SlotLocation>>
+    where
+        K: Borrow<Q>,
+        Q: Eq + ?Sized,
+    {
+        let search_limit = (self.max_populated_level + 1).min(self.levels.len());
+        for (offset, level) in self.levels[1..search_limit].iter().enumerate() {
+            match Self::find_in_level_bucket(key_hash, key_fingerprint, key, level) {
+                LookupStep::Found(slot_idx) => {
+                    return ControlFlow::Break(Some(SlotLocation::Level {
+                        level_idx: offset + 1,
+                        slot_idx,
+                    }));
+                }
+                LookupStep::Continue => {}
+                LookupStep::StopSearch => return ControlFlow::Break(None),
+            }
+        }
+        ControlFlow::Continue(())
     }
 
     #[cold]
