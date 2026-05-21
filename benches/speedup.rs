@@ -57,6 +57,8 @@ const TINY_LOOKUP_COUNT: usize = 20_000;
 const DELETE_MAP_SIZE: usize = 12_000;
 const DELETE_OP_COUNT: usize = 6_000;
 const RESIZE_INSERT_COUNT: usize = 8_000;
+const MIXED_MAP_SIZE: usize = 20_000;
+const MIXED_OP_COUNT: usize = 200_000;
 
 /// Emits per-impl `bench_function` blocks
 macro_rules! bench_all_impls {
@@ -176,6 +178,40 @@ fn bench_delete_heavy_throughput(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_mixed_throughput(c: &mut Criterion) {
+    let pairs = make_pairs(MIXED_MAP_SIZE);
+    let ops: Vec<(usize, bool)> = (0..MIXED_OP_COUNT)
+        .map(|i| {
+            let idx = ((i as u32).wrapping_mul(2_654_435_761) as usize) % MIXED_MAP_SIZE;
+            (idx, i & 1 == 0)
+        })
+        .collect();
+
+    let mut group = c.benchmark_group("mixed_throughput");
+    group.throughput(Throughput::Elements(MIXED_OP_COUNT as u64));
+
+    bench_all_impls!(
+        group,
+        BatchSize::LargeInput,
+        || build_std_map(&pairs),
+        || build_hashbrown_map(&pairs),
+        || build_elastic_map(&pairs),
+        || build_funnel_map(&pairs),
+        |map| {
+            for &(idx, is_read) in &ops {
+                let key = pairs[idx].0;
+                if is_read {
+                    black_box(map.get(black_box(&key)));
+                } else {
+                    black_box(map.insert(black_box(key), black_box(idx as u64)));
+                }
+            }
+        },
+    );
+
+    group.finish();
+}
+
 fn bench_resize_heavy_throughput(c: &mut Criterion) {
     let pairs = make_pairs(RESIZE_INSERT_COUNT);
     let mut group = c.benchmark_group("resize_heavy_throughput");
@@ -241,6 +277,7 @@ criterion_group!(
         bench_get_hit_throughput,
         bench_get_miss_throughput,
         bench_tiny_lookup_throughput,
+        bench_mixed_throughput,
         bench_delete_heavy_throughput,
         bench_resize_heavy_throughput,
         bench_get_hit_latency

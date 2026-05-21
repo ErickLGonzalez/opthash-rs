@@ -15,8 +15,10 @@ WORKLOADS = (
     ("insert", "Insert"),
     ("get_hit", "Get Hit"),
     ("get_miss", "Get Miss"),
+    ("tiny_lookup", "Tiny"),
     ("mixed", "Mixed"),
     ("delete", "Delete"),
+    ("resize", "Resize"),
 )
 
 IMPLS = ("dict", "elastic", "funnel")

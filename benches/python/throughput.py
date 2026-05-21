@@ -15,6 +15,9 @@ import opthash
 
 
 N = 10_000
+TINY_N = 32
+TINY_QUERIES = 20_000
+RESIZE_N = 8_000
 SEED = 42
 
 
@@ -22,12 +25,12 @@ def _factory_dict(_n: int):
     return dict()
 
 
-def _factory_elastic(_n: int):
-    return opthash.ElasticHashMap()
+def _factory_elastic(n: int):
+    return opthash.ElasticHashMap(capacity=n)
 
 
-def _factory_funnel(_n: int):
-    return opthash.FunnelHashMap()
+def _factory_funnel(n: int):
+    return opthash.FunnelHashMap(capacity=n)
 
 
 IMPLS = [
@@ -51,6 +54,27 @@ def miss_keys() -> list[str]:
 def mixed_indices() -> list[int]:
     rng = random.Random(SEED)
     return [rng.randrange(N) for _ in range(N)]
+
+
+@pytest.fixture(scope="module")
+def tiny_keys() -> list[str]:
+    return [f"tkey_{i}" for i in range(TINY_N)]
+
+
+@pytest.fixture(scope="module")
+def tiny_query_keys(tiny_keys) -> list[str]:
+    out: list[str] = []
+    for idx in range(TINY_QUERIES):
+        if idx % 2 == 0:
+            out.append(tiny_keys[idx % TINY_N])
+        else:
+            out.append(f"tmiss_{idx}")
+    return out
+
+
+@pytest.fixture(scope="module")
+def resize_keys() -> list[str]:
+    return [f"rkey_{i}" for i in range(RESIZE_N)]
 
 
 @pytest.mark.benchmark(group="insert")
@@ -119,6 +143,31 @@ def test_delete(benchmark, factory, keys):
             m[k] = 0
         for k in keys:
             del m[k]
+
+    benchmark(run)
+
+
+@pytest.mark.benchmark(group="tiny_lookup")
+@pytest.mark.parametrize("factory", IMPLS)
+def test_tiny_lookup(benchmark, factory, tiny_keys, tiny_query_keys):
+    m = factory(TINY_N)
+    for k in tiny_keys:
+        m[k] = 0
+
+    def run():
+        for k in tiny_query_keys:
+            _ = m.get(k)
+
+    benchmark(run)
+
+
+@pytest.mark.benchmark(group="resize")
+@pytest.mark.parametrize("factory", IMPLS)
+def test_resize(benchmark, factory, resize_keys):
+    def run():
+        m = factory(0)
+        for k in resize_keys:
+            m[k] = 0
 
     benchmark(run)
 

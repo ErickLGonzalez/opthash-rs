@@ -18,6 +18,7 @@ THROUGHPUT_WORKLOADS = (
     ("get_hit_throughput", "Get Hit"),
     ("get_miss_throughput", "Get Miss"),
     ("tiny_lookup_throughput", "Tiny"),
+    ("mixed_throughput", "Mixed"),
     ("delete_heavy_throughput", "Delete"),
     ("resize_heavy_throughput", "Resize"),
 )

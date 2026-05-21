@@ -8,7 +8,7 @@ Run all of these after every refactor. Check benchmark results in `target/criter
 cargo fmt                                   # Format Rust code
 cargo clippy --all-features -- -W clippy::pedantic   # Lint with pedantic warnings
 cargo test                                  # Run all tests
-cargo bench                                 # Run all benchmarks
+scripts/bench.sh                            # Run all benchmarks (noise-controlled — see Benchmarks)
 uvx ruff format                             # Format Python code (scripts/, tests/)
 pre-commit run --all-files                  # Run formatters on the whole tree
 ```
@@ -22,29 +22,28 @@ pre-commit install
 
 ## Benchmarks
 
-Criterion benchmark suite comparing `ElasticHashMap`, `FunnelHashMap`, `std::HashMap`, and `hashbrown::HashMap` (SwissTable + foldhash — absolute ceiling reference):
+Criterion suite comparing `ElasticHashMap`, `FunnelHashMap`, `std::HashMap`, `hashbrown::HashMap` (SwissTable + foldhash — absolute ceiling).
 
-- **`cargo bench --bench speedup`** — throughput (insert, get hit/miss/mixed/tiny, delete-heavy, resize-heavy) and Criterion-mean per-lookup latency at varying map sizes
-- Run a subset: `cargo bench --bench speedup -- "get_hit_latency"` (Criterion name filter)
-
-Criterion auto-compares against the previous run. **Always read results from the JSON files** — terminal output gets truncated and mixes runs. Parse `target/criterion/` after a single `cargo bench` invocation:
-
-- `target/criterion/<group>/<variant>/new/estimates.json` — absolute timing (`mean.point_estimate` in nanoseconds)
-- `target/criterion/<group>/<variant>/change/estimates.json` — relative change vs. previous run (`mean.point_estimate` as a fraction, e.g. +0.05 = 5% slower)
-
-Example path: `target/criterion/get_hit_throughput/elastic/change/estimates.json`
-
-#### Low-noise runs
-
-`scripts/bench.sh` wraps `cargo bench` with `taskset -c $CORE` + `setarch -R` (no privileges needed). Run with `sudo` to additionally pin governor=performance, disable Intel turbo, and run at SCHED_FIFO/99 — the script drops back to `$SUDO_USER` for the cargo invocation so build artifacts stay user-owned. `BENCH` defaults to `all` (runs `speedup` then `latency` sequentially); set `BENCH=speedup` or `BENCH=latency` for single-target iteration. Workflow:
+**Always use `scripts/bench.sh` for results you'll act on.** Raw `cargo bench` is unpinned — wall-clock noise can swing ±10% and flip the sign of real ±5% changes. Use raw cargo only for smoke runs / single-filter iteration.
 
 ```bash
-scripts/bench.sh                            # save baseline as "ref"
+scripts/bench.sh                            # baseline → "ref"
 # … apply change …
-BASELINE=ref scripts/bench.sh               # compare against the pinned baseline
+BASELINE=ref scripts/bench.sh               # compare vs ref
 ```
 
-Re-pin `ref` whenever the harness env changes (sudo vs not, core pin) — Criterion compares wall-clock timings, so a baseline saved at boost frequency is meaningless once turbo is disabled. Pass override flags after `--`, e.g. `BASELINE=ref scripts/bench.sh -- --measurement-time 10 --sample-size 200`. The `latency` bench is a custom harness (writes histograms to `target/latency/`) and ignores `--baseline`.
+- Wraps `cargo bench` with `taskset -c $CORE` + `setarch -R` (no privileges). `sudo` adds governor=performance, turbo off, SCHED_FIFO/99; drops back to `$SUDO_USER` for cargo.
+- `BENCH=all` (default) runs `speedup` then `latency`; set `BENCH=speedup|latency` for single-target.
+- Re-pin `ref` when env changes (sudo vs not, core pin) — baselines are wall-clock.
+- Pass through flags: `BASELINE=ref scripts/bench.sh -- --measurement-time 10`. Criterion name filter: `scripts/bench.sh -- "get_hit_latency"`.
+- `latency` bench writes histograms to `target/latency/` and ignores `--baseline`.
+
+**Read results from JSON, not stdout** (stdout truncates + mixes runs):
+
+- `target/criterion/<group>/<variant>/new/estimates.json` — absolute ns (`mean.point_estimate`)
+- `target/criterion/<group>/<variant>/change/estimates.json` — fractional change vs prev (e.g. +0.05 = 5% slower)
+
+Example: `target/criterion/get_hit_throughput/elastic/change/estimates.json`
 
 ### Tail-latency harness
 
