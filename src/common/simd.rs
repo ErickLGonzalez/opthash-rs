@@ -44,33 +44,6 @@ pub(super) fn match_fingerprint_group_u32(ptr: *const u8, target: u8) -> u32 {
 }
 
 // ---------------------------------------------------------------------------
-// Probe helpers (ProbeOps)
-// ---------------------------------------------------------------------------
-
-pub(crate) struct ProbeOps;
-
-impl ProbeOps {
-    #[allow(
-        clippy::cast_precision_loss,
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss
-    )]
-    #[inline]
-    #[must_use]
-    pub(crate) fn log_log_probe_limit(capacity: usize) -> usize {
-        let n = capacity.max(4) as f64;
-        n.log2().max(2.0).log2().ceil().max(1.0) as usize
-    }
-
-    #[allow(clippy::cast_possible_truncation)]
-    #[inline]
-    #[must_use]
-    pub(crate) fn hash_to_usize(hash: u64) -> usize {
-        hash as usize
-    }
-}
-
-// ---------------------------------------------------------------------------
 // SIMD mask functions
 // ---------------------------------------------------------------------------
 

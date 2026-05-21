@@ -2,81 +2,151 @@ use super::config::{
     DEFAULT_RESERVE_FRACTION, GROUP_SIZE, MAX_RESERVE_FRACTION, MIN_RESERVE_FRACTION,
 };
 
-#[allow(clippy::cast_precision_loss)]
-#[inline]
-pub(crate) fn usize_to_f64(value: usize) -> f64 {
-    value as f64
-}
-
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-#[inline]
-pub(crate) fn floor_to_usize(value: f64) -> usize {
-    value.floor() as usize
-}
-
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-#[inline]
-pub(crate) fn ceil_to_usize(value: f64) -> usize {
-    value.ceil() as usize
-}
-
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-#[inline]
-pub(crate) fn round_to_usize(value: f64) -> usize {
-    value.round() as usize
-}
-
-#[inline]
-pub(crate) fn max_insertions(capacity: usize, reserve_fraction: f64) -> usize {
-    capacity.saturating_sub(floor_to_usize(reserve_fraction * usize_to_f64(capacity)))
-}
-
-/// Smallest capacity `>= start` (doubling each step) whose `max_insertions`
-/// accommodates `needed`. Returns `None` if doubling overflows before the
-/// threshold is reached.
-#[inline]
-pub(crate) fn capacity_for(start: usize, needed: usize, reserve_fraction: f64) -> Option<usize> {
-    let mut cap = start;
-    while max_insertions(cap, reserve_fraction) < needed {
-        cap = cap.checked_mul(2)?;
+/// `f64 ↔ usize` casts with the truncation/sign lints we accept here.
+pub(crate) mod cast {
+    #[allow(clippy::cast_precision_loss)]
+    #[inline]
+    pub(crate) fn usize_to_f64(value: usize) -> f64 {
+        value as f64
     }
-    Some(cap)
-}
 
-pub(crate) fn sanitize_reserve_fraction(reserve_fraction: f64) -> f64 {
-    if reserve_fraction.is_finite() {
-        reserve_fraction.clamp(MIN_RESERVE_FRACTION, MAX_RESERVE_FRACTION)
-    } else {
-        DEFAULT_RESERVE_FRACTION
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[inline]
+    pub(crate) fn floor_to_usize(value: f64) -> usize {
+        value.floor() as usize
+    }
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[inline]
+    pub(crate) fn ceil_to_usize(value: f64) -> usize {
+        value.ceil() as usize
+    }
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[inline]
+    pub(crate) fn round_to_usize(value: f64) -> usize {
+        value.round() as usize
     }
 }
 
-pub(crate) fn ceil_three_quarters(value: usize) -> usize {
-    (value.saturating_mul(3).saturating_add(3)) / 4
-}
+/// Capacity + reserve-fraction arithmetic.
+pub(crate) mod capacity {
+    use super::cast::{floor_to_usize, usize_to_f64};
+    use super::{DEFAULT_RESERVE_FRACTION, MAX_RESERVE_FRACTION, MIN_RESERVE_FRACTION};
 
-pub(crate) fn floor_half_reserve_slots(reserve_fraction: f64, value: usize) -> usize {
-    floor_to_usize((reserve_fraction * usize_to_f64(value)) / 2.0)
-}
+    #[inline]
+    pub(crate) fn max_insertions(capacity: usize, reserve_fraction: f64) -> usize {
+        capacity.saturating_sub(floor_to_usize(reserve_fraction * usize_to_f64(capacity)))
+    }
 
-#[inline]
-pub(crate) fn round_up_to_group(value: usize) -> usize {
-    if value == 0 {
-        0
-    } else {
-        value.div_ceil(GROUP_SIZE) * GROUP_SIZE
+    /// Smallest capacity `>= start` (doubling) whose `max_insertions` fits
+    /// `needed`. `None` if doubling overflows before reaching it.
+    #[inline]
+    pub(crate) fn capacity_for(
+        start: usize,
+        needed: usize,
+        reserve_fraction: f64,
+    ) -> Option<usize> {
+        let mut cap = start;
+        while max_insertions(cap, reserve_fraction) < needed {
+            cap = cap.checked_mul(2)?;
+        }
+        Some(cap)
+    }
+
+    pub(crate) fn sanitize_reserve_fraction(reserve_fraction: f64) -> f64 {
+        if reserve_fraction.is_finite() {
+            reserve_fraction.clamp(MIN_RESERVE_FRACTION, MAX_RESERVE_FRACTION)
+        } else {
+            DEFAULT_RESERVE_FRACTION
+        }
+    }
+
+    pub(crate) fn ceil_three_quarters(value: usize) -> usize {
+        (value.saturating_mul(3).saturating_add(3)) / 4
+    }
+
+    pub(crate) fn floor_half_reserve_slots(reserve_fraction: f64, value: usize) -> usize {
+        floor_to_usize((reserve_fraction * usize_to_f64(value)) / 2.0)
     }
 }
 
-/// Round `slots` up so `group_count = ceil(slots / GROUP_SIZE)` is pow2 —
-/// required for `(idx + delta) & (group_count - 1)` to wrap the full range.
-#[inline]
-pub(crate) fn round_up_to_pow2_groups(slots: usize) -> usize {
-    if slots == 0 {
-        return 0;
+/// Slot/group-count rounding for layout alignment.
+pub(crate) mod align {
+    use super::GROUP_SIZE;
+
+    #[inline]
+    pub(crate) fn round_up_to_group(value: usize) -> usize {
+        if value == 0 {
+            0
+        } else {
+            value.div_ceil(GROUP_SIZE) * GROUP_SIZE
+        }
     }
-    let groups = slots.div_ceil(GROUP_SIZE).max(1).next_power_of_two();
-    groups * GROUP_SIZE
+
+    /// Round `slots` up so `group_count = ceil(slots / GROUP_SIZE)` is pow2 —
+    /// required for `(idx + delta) & (group_count - 1)` to wrap the full range.
+    #[inline]
+    pub(crate) fn round_up_to_pow2_groups(slots: usize) -> usize {
+        if slots == 0 {
+            return 0;
+        }
+        let groups = slots.div_ceil(GROUP_SIZE).max(1).next_power_of_two();
+        groups * GROUP_SIZE
+    }
+}
+
+/// Lemire fastmod — precompute a magic once, evaluate `a % d` as a mul-shift.
+pub(crate) mod fastmod {
+    /// Precompute `M = ceil(2^64 / d)`. `d` must be non-zero and fit in `u32`.
+    ///
+    /// # Panics
+    ///
+    /// If `d` does not fit in `u32`.
+    #[inline]
+    #[must_use]
+    pub(crate) fn fastmod_magic(d: usize) -> u64 {
+        let d_u32 = u32::try_from(d).expect("fastmod divisor fits in u32");
+        debug_assert!(d_u32 != 0);
+        (u64::MAX / u64::from(d_u32)).wrapping_add(1)
+    }
+
+    /// `a % d` via the magic from [`fastmod_magic`]. Only the low 32 bits of
+    /// `a` contribute; `d` is the same value originally passed in.
+    #[inline]
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub(crate) fn fastmod_u32(a: u64, m: u64, d: usize) -> usize {
+        // `d` fits in u32 by `fastmod_magic`'s precondition.
+        let d_u32 = d as u32;
+        let a_lo = a as u32;
+        let lowbits = m.wrapping_mul(u64::from(a_lo));
+        // (lowbits < 2^64) * (d < 2^32) < 2^96, so the >>64 result fits in u32.
+        let result = ((u128::from(lowbits) * u128::from(d_u32)) >> 64) as u32;
+        result as usize
+    }
+}
+
+/// Probe-limit and hash-to-index helpers shared across maps.
+pub(crate) mod probe {
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    #[inline]
+    #[must_use]
+    pub(crate) fn log_log_probe_limit(capacity: usize) -> usize {
+        let n = capacity.max(4) as f64;
+        n.log2().max(2.0).log2().ceil().max(1.0) as usize
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    #[inline]
+    #[must_use]
+    pub(crate) fn hash_to_usize(hash: u64) -> usize {
+        hash as usize
+    }
 }
 
 /// Knuth multiplicative-hash constant (golden ratio * 2^64, odd).
@@ -88,35 +158,4 @@ const GOLDEN_RATIO_U64: u64 = 0x9E37_79B9_7F4A_7C15;
 pub(crate) fn level_salt(level_idx: usize) -> u64 {
     // usize fits in u64 on every Rust target (max 64-bit pointer width).
     GOLDEN_RATIO_U64.wrapping_mul((level_idx as u64).wrapping_add(1))
-}
-
-/// Lemire fastmod: precompute magic `M = ceil(2^64 / d)` once so that each
-/// later `a % d` becomes a multiply-shift. `d` must be non-zero and fit in
-/// `u32` (panics otherwise).
-#[inline]
-#[must_use]
-pub(crate) fn fastmod_magic(d: usize) -> u64 {
-    let d_u32 = u32::try_from(d).expect("fastmod divisor fits in u32");
-    debug_assert!(d_u32 != 0);
-    (u64::MAX / u64::from(d_u32)).wrapping_add(1)
-}
-
-/// Evaluates `(a mod d)` using the magic produced by [`fastmod_magic`]. `a`
-/// contributes through its low 32 bits; `d` is the same value originally
-/// passed to `fastmod_magic`. All narrowing casts are safe given that
-/// precondition (see inline comments).
-#[inline]
-#[must_use]
-#[allow(clippy::cast_possible_truncation)]
-pub(crate) fn fastmod_u32(a: u64, m: u64, d: usize) -> usize {
-    // `d` fits in u32 by the magic-builder precondition, so the truncation is
-    // exact. Only the low 32 bits of `a` participate in Lemire's trick; we
-    // sample them explicitly so callers don't need to narrow first.
-    let d_u32 = d as u32;
-    let a_lo = a as u32;
-    let lowbits = m.wrapping_mul(u64::from(a_lo));
-    // lowbits < 2^64 and d < 2^32, so (lowbits * d) < 2^96 and the final
-    // shift-right-by-64 yields a value that fits in u32.
-    let result = ((u128::from(lowbits) * u128::from(d_u32)) >> 64) as u32;
-    result as usize
 }

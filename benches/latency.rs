@@ -12,10 +12,15 @@ use common::{
 };
 use hdrhistogram::Histogram;
 
+/// Map implementations measured side-by-side.
 const MAPS: &[&str] = &["std", "hashbrown", "elastic", "funnel"];
+/// Items inserted into the map before sampling.
 const SIZE: usize = 10_000_000;
+/// Operation label written into the output JSON.
 const OP: &str = "get-hit";
+/// Latency samples recorded per (map, op).
 const SAMPLES: usize = 1_000_000;
+/// Pre-sample warmup iterations to stabilize caches + branch predictor.
 const WARMUP: usize = 10_000;
 
 fn elapsed_ns(start: Instant) -> u64 {

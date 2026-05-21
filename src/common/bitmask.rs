@@ -5,6 +5,7 @@ pub(crate) type BitMaskWord = u64;
 #[cfg(not(target_arch = "aarch64"))]
 pub(crate) type BitMaskWord = u16;
 
+/// Bits-per-slot in [`BitMask`]: 4 on aarch64 (NEON nibble layout), 1 elsewhere.
 #[cfg(target_arch = "aarch64")]
 pub(crate) const BITMASK_STRIDE: u32 = 4;
 #[cfg(not(target_arch = "aarch64"))]

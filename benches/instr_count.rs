@@ -17,6 +17,7 @@ use common::{
     build_elastic_map, build_funnel_map, build_hashbrown_map, build_std_map, key_at, make_pairs,
 };
 
+/// Map size for every instruction-count bench in this file.
 const N: usize = 1_024;
 
 // ---------------------------------------------------------------------------

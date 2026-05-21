@@ -7,28 +7,12 @@ use allocator_api2::vec::Vec;
 
 use super::TryReserveError;
 use super::bitmask::BitMask;
-use super::config::GROUP_SIZE;
+use super::config::{CONTROL_ALIGN, GROUP_SIZE};
 use super::control::{CTRL_EMPTY, CTRL_TOMBSTONE};
-use super::math::round_up_to_group;
-use super::simd::{eq_mask_16, free_mask_16};
+use super::math::align;
+use super::simd::{eq_mask_16, free_mask_16, prefetch_read};
 
-/// Fallibly allocates a zero-filled `Box<[T], A>` in `alloc`.
-pub(crate) fn try_zeroed_boxed_slice_in<T: Default + Clone, A: Allocator>(
-    len: usize,
-    alloc: A,
-) -> Result<Box<[T], A>, TryReserveError> {
-    let mut buf: Vec<T, A> = Vec::new_in(alloc);
-    buf.try_reserve_exact(len)
-        .map_err(|_| TryReserveError::AllocError)?;
-    buf.resize(len, T::default());
-    Ok(buf.into_boxed_slice())
-}
-
-/// Alignment for the control-byte region. Matches 64-byte cache lines so
-/// the first group is line-aligned and groups pack 4-per-line without splits.
-const CONTROL_ALIGN: usize = 64;
-
-pub(crate) struct Entry<K, V> {
+pub(crate) struct SlotEntry<K, V> {
     pub(crate) key: K,
     pub(crate) value: V,
 }
@@ -80,7 +64,7 @@ impl<T, A: Allocator> RawTable<T, A> {
             return Self::empty_in(alloc);
         }
 
-        let capacity = round_up_to_group(capacity);
+        let capacity = align::round_up_to_group(capacity);
         let group_count = capacity / GROUP_SIZE;
         let (layout, ctrl_offset) = Self::unified_layout(capacity, group_count);
 
@@ -109,7 +93,7 @@ impl<T, A: Allocator> RawTable<T, A> {
             return Ok(Self::empty_in(alloc));
         }
 
-        let capacity = round_up_to_group(capacity);
+        let capacity = align::round_up_to_group(capacity);
         let group_count = capacity / GROUP_SIZE;
         let (layout, ctrl_offset) = Self::try_unified_layout(capacity, group_count).ok_or(())?;
 
@@ -214,8 +198,27 @@ impl<T, A: Allocator> RawTable<T, A> {
         );
         // SAFETY: caller upholds `capacity > 0` and `idx < capacity`.
         unsafe {
-            super::simd::prefetch_read(self.slots_ptr().add(idx).cast::<u8>());
+            prefetch_read(self.slots_ptr().add(idx).cast::<u8>());
         }
+    }
+
+    /// Prefetch the 16-byte control group at `group_idx`; call one probe
+    /// ahead to warm L1 before the next SIMD scan.
+    ///
+    /// # Safety
+    ///
+    /// `capacity > 0 && group_idx < group_count` — empty tables hold a
+    /// dangling `ctrl_ptr`, so a nonzero offset would be UB.
+    #[inline]
+    pub(crate) unsafe fn prefetch_group_controls(&self, group_idx: usize) {
+        debug_assert!(self.capacity > 0, "prefetch_group_controls: empty table");
+        debug_assert!(
+            group_idx < self.group_count,
+            "prefetch_group_controls: group_idx {group_idx} >= group_count {}",
+            self.group_count
+        );
+        // SAFETY: caller upholds `capacity > 0` and `group_idx < group_count`.
+        unsafe { prefetch_read(self.ctrl_ptr().add(group_idx * GROUP_SIZE)) };
     }
 
     #[inline]
@@ -357,6 +360,18 @@ impl<T, A: Allocator> RawTable<T, A> {
             None
         }
     }
+}
+
+/// Fallibly allocates a zero-filled `Box<[T], A>` in `alloc`.
+pub(crate) fn try_zeroed_boxed_slice_in<T: Default + Clone, A: Allocator>(
+    len: usize,
+    alloc: A,
+) -> Result<Box<[T], A>, TryReserveError> {
+    let mut buf: Vec<T, A> = Vec::new_in(alloc);
+    buf.try_reserve_exact(len)
+        .map_err(|_| TryReserveError::AllocError)?;
+    buf.resize(len, T::default());
+    Ok(buf.into_boxed_slice())
 }
 
 #[cfg(test)]

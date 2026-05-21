@@ -9,22 +9,18 @@ use std::ptr;
 use allocator_api2::boxed::Box as ABox;
 use allocator_api2::vec::Vec as AVec;
 
-use crate::common::config::{DEFAULT_RESERVE_FRACTION, GROUP_SIZE, INITIAL_CAPACITY};
-use crate::common::control::{CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte, ControlOps};
+use crate::common::config::{
+    DEFAULT_PROBE_SCALE, DEFAULT_RESERVE_FRACTION, GROUP_SIZE, INITIAL_CAPACITY,
+};
+use crate::common::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte};
 use crate::common::error::{EntryView, OccupiedError as CommonOccupiedError};
 use crate::common::iter::{
     IntoKeys as CommonIntoKeys, IntoValues as CommonIntoValues, Keys as CommonKeys,
     OccupiedScanner, Values as CommonValues,
 };
-use crate::common::layout::{Entry as SlotEntry, RawTable};
-use crate::common::math::{
-    capacity_for, ceil_three_quarters, floor_half_reserve_slots, level_salt, max_insertions,
-    round_up_to_pow2_groups, sanitize_reserve_fraction, usize_to_f64,
-};
-use crate::common::simd::ProbeOps;
+use crate::common::layout::{RawTable, SlotEntry};
+use crate::common::math::{align, capacity, cast, level_salt, probe};
 use crate::common::{Allocator, DefaultHashBuilder, Global, TryReserveError};
-
-const DEFAULT_PROBE_SCALE: f64 = 16.0;
 
 /// Construction-time tuning for `ElasticHashMap`.
 #[derive(Debug, Clone, Copy)]
@@ -121,7 +117,10 @@ impl<K, V, A: Allocator + Clone> Level<K, V, A> {
             salt: level_salt(level_idx),
             group_count_mask: group_count.wrapping_sub(1),
             tombstones: 0,
-            half_reserve_slot_threshold: floor_half_reserve_slots(reserve_fraction, capacity),
+            half_reserve_slot_threshold: capacity::floor_half_reserve_slots(
+                reserve_fraction,
+                capacity,
+            ),
             limited_probe_budgets,
         }
     }
@@ -150,7 +149,10 @@ impl<K, V, A: Allocator + Clone> Level<K, V, A> {
             salt: level_salt(level_idx),
             group_count_mask: group_count.wrapping_sub(1),
             tombstones: 0,
-            half_reserve_slot_threshold: floor_half_reserve_slots(reserve_fraction, capacity),
+            half_reserve_slot_threshold: capacity::floor_half_reserve_slots(
+                reserve_fraction,
+                capacity,
+            ),
             limited_probe_budgets,
         })
     }
@@ -343,10 +345,10 @@ where
     /// across grows.
     #[must_use]
     pub fn with_options_and_hasher_in(options: ElasticOptions, hash_builder: S, alloc: A) -> Self {
-        let reserve_fraction = sanitize_reserve_fraction(options.reserve_fraction);
+        let reserve_fraction = capacity::sanitize_reserve_fraction(options.reserve_fraction);
         let probe_scale = sanitize_probe_scale(options.probe_scale);
         let capacity = options.capacity;
-        let max_insertions = max_insertions(capacity, reserve_fraction);
+        let max_insertions = capacity::max_insertions(capacity, reserve_fraction);
 
         let level_capacities = partition_levels(capacity);
         let levels = level_capacities
@@ -455,7 +457,7 @@ where
     /// # Panics
     ///
     /// Panics if no representable capacity satisfies
-    /// `max_insertions(cap) >= min_capacity`.
+    /// `capacity::max_insertions(cap) >= min_capacity`.
     pub fn shrink_to(&mut self, min_capacity: usize) {
         if self.len == 0 && min_capacity == 0 {
             if self.capacity > 0 {
@@ -464,7 +466,7 @@ where
             return;
         }
         let lower = self.len.max(min_capacity).max(INITIAL_CAPACITY);
-        let new_capacity = capacity_for(INITIAL_CAPACITY, lower, self.reserve_fraction)
+        let new_capacity = capacity::capacity_for(INITIAL_CAPACITY, lower, self.reserve_fraction)
             .expect("capacity overflow");
         if new_capacity >= self.capacity {
             return;
@@ -476,7 +478,7 @@ where
     /// `needed` live entries. Returns `None` if no representable capacity
     /// suffices. Used by `reserve` / `try_reserve`.
     fn grow_capacity_for(&self, needed: usize) -> Option<usize> {
-        capacity_for(
+        capacity::capacity_for(
             self.capacity.max(INITIAL_CAPACITY),
             needed,
             self.reserve_fraction,
@@ -488,7 +490,7 @@ where
     /// Panics if a resize succeeds but no free slot can be found for the new key.
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
         let key_hash = self.hash_key(&key);
-        let key_fingerprint = ControlOps::control_fingerprint(key_hash);
+        let key_fingerprint = control::control_fingerprint(key_hash);
 
         if let Some((level_idx, slot_idx)) =
             self.find_slot_indices_with_hash(&key, key_hash, key_fingerprint)
@@ -537,7 +539,7 @@ where
         Q: Hash + Eq + ?Sized,
     {
         let key_hash = self.hash_key(key);
-        let key_fingerprint = ControlOps::control_fingerprint(key_hash);
+        let key_fingerprint = control::control_fingerprint(key_hash);
         let (level_idx, slot_idx) =
             self.find_slot_indices_with_hash(key, key_hash, key_fingerprint)?;
         Some(unsafe { &self.levels[level_idx].table.get_ref(slot_idx).value })
@@ -550,7 +552,7 @@ where
         Q: Hash + Eq + ?Sized,
     {
         let key_hash = self.hash_key(key);
-        let key_fingerprint = ControlOps::control_fingerprint(key_hash);
+        let key_fingerprint = control::control_fingerprint(key_hash);
         let (level_idx, slot_idx) =
             self.find_slot_indices_with_hash(key, key_hash, key_fingerprint)?;
         let entry = unsafe { self.levels[level_idx].table.get_ref(slot_idx) };
@@ -563,7 +565,7 @@ where
         Q: Hash + Eq + ?Sized,
     {
         let key_hash = self.hash_key(key);
-        let key_fingerprint = ControlOps::control_fingerprint(key_hash);
+        let key_fingerprint = control::control_fingerprint(key_hash);
         let (level_idx, slot_idx) =
             self.find_slot_indices_with_hash(key, key_hash, key_fingerprint)?;
         Some(unsafe { &mut self.levels[level_idx].table.get_mut(slot_idx).value })
@@ -584,7 +586,7 @@ where
         let mut locations: [(usize, usize); N] = [(0, 0); N];
         for (i, key) in keys.iter().enumerate() {
             let key_hash = self.hash_key(*key);
-            let key_fingerprint = ControlOps::control_fingerprint(key_hash);
+            let key_fingerprint = control::control_fingerprint(key_hash);
             locations[i] = self.find_slot_indices_with_hash(*key, key_hash, key_fingerprint)?;
         }
 
@@ -631,7 +633,7 @@ where
         let mut locations: [(usize, usize); N] = [(0, 0); N];
         for (i, key) in keys.iter().enumerate() {
             let key_hash = self.hash_key(*key);
-            let key_fingerprint = ControlOps::control_fingerprint(key_hash);
+            let key_fingerprint = control::control_fingerprint(key_hash);
             locations[i] = self.find_slot_indices_with_hash(*key, key_hash, key_fingerprint)?;
         }
 
@@ -653,7 +655,7 @@ where
         Q: Hash + Eq + ?Sized,
     {
         let key_hash = self.hash_key(key);
-        let key_fingerprint = ControlOps::control_fingerprint(key_hash);
+        let key_fingerprint = control::control_fingerprint(key_hash);
         self.find_slot_indices_with_hash(key, key_hash, key_fingerprint)
             .is_some()
     }
@@ -681,7 +683,7 @@ where
         Q: Hash + Eq + ?Sized,
     {
         let key_hash = self.hash_key(key);
-        let key_fingerprint = ControlOps::control_fingerprint(key_hash);
+        let key_fingerprint = control::control_fingerprint(key_hash);
         let (level_idx, slot_idx) =
             self.find_slot_indices_with_hash(key, key_hash, key_fingerprint)?;
 
@@ -783,7 +785,7 @@ where
     /// Mirrors [`std::collections::HashMap::entry`].
     pub fn entry(&mut self, key: K) -> Entry<'_, K, V, S, A> {
         let key_hash = self.hash_key(&key);
-        let key_fingerprint = ControlOps::control_fingerprint(key_hash);
+        let key_fingerprint = control::control_fingerprint(key_hash);
         if let Some((level_idx, slot_idx)) =
             self.find_slot_indices_with_hash(&key, key_hash, key_fingerprint)
         {
@@ -821,7 +823,7 @@ where
     /// Post-lookup insert for a key known to be absent. Returns the chosen
     /// slot so the caller can borrow into it without re-probing.
     fn insert_for_vacant_entry(&mut self, key: K, value: V, key_hash: u64) -> (usize, usize) {
-        let key_fingerprint = ControlOps::control_fingerprint(key_hash);
+        let key_fingerprint = control::control_fingerprint(key_hash);
 
         if self.len >= self.max_insertions {
             let new_capacity = if self.capacity == 0 {
@@ -1508,7 +1510,7 @@ where
                 )
             })
             .collect::<Vec<_>>();
-        let new_max_insertions = max_insertions(new_capacity, self.reserve_fraction);
+        let new_max_insertions = capacity::max_insertions(new_capacity, self.reserve_fraction);
         let new_batch_plan =
             build_batch_plan(&level_capacities, self.reserve_fraction, new_max_insertions);
         let new_batch_remaining = new_batch_plan.first().copied().unwrap_or(0);
@@ -1569,10 +1571,10 @@ where
         hash_builder: S,
         alloc: A,
     ) -> Result<Self, TryReserveError> {
-        let reserve_fraction = sanitize_reserve_fraction(options.reserve_fraction);
+        let reserve_fraction = capacity::sanitize_reserve_fraction(options.reserve_fraction);
         let probe_scale = sanitize_probe_scale(options.probe_scale);
         let capacity = options.capacity;
-        let max_insertions = max_insertions(capacity, reserve_fraction);
+        let max_insertions = capacity::max_insertions(capacity, reserve_fraction);
 
         let level_capacities = partition_levels(capacity);
         let mut levels: Vec<Level<K, V, A>> = Vec::new();
@@ -1835,7 +1837,7 @@ where
     #[inline]
     fn triangular_group_start(level: &Level<K, V, A>, key_hash: u64) -> usize {
         let mixed = key_hash ^ level.salt;
-        ProbeOps::hash_to_usize(mixed) & level.group_count_mask
+        probe::hash_to_usize(mixed) & level.group_count_mask
     }
 
     /// After a remove, walk down `max_populated_level` past any now-empty
@@ -1945,7 +1947,7 @@ fn fill_probe_budgets(
     probe_scale: f64,
 ) {
     let max_budget = group_count.max(1);
-    let cap_f = usize_to_f64(capacity);
+    let cap_f = cast::usize_to_f64(capacity);
     let log_cap = (1.0 / reserve_fraction).log2();
 
     // Budget(fs) is a non-increasing staircase function of free_slots.
@@ -2000,7 +2002,10 @@ fn partition_levels(total_capacity: usize) -> Vec<usize> {
         next_size = (size / 2).max(1);
     }
 
-    sizes.into_iter().map(round_up_to_pow2_groups).collect()
+    sizes
+        .into_iter()
+        .map(align::round_up_to_pow2_groups)
+        .collect()
 }
 
 /// Build the per-batch insertion quota that drives `current_batch_index`.
@@ -2017,17 +2022,17 @@ fn build_batch_plan(
     }
 
     let mut plan = Vec::with_capacity(level_capacities.len() + 1);
-    plan.push(ceil_three_quarters(level_capacities[0]));
+    plan.push(capacity::ceil_three_quarters(level_capacities[0]));
 
     for level_index in 1..level_capacities.len() {
         let current_level_capacity = level_capacities[level_index - 1];
         let next_level_capacity = level_capacities[level_index];
 
         let target_current_level_occupancy = current_level_capacity.saturating_sub(
-            floor_half_reserve_slots(reserve_fraction, current_level_capacity),
+            capacity::floor_half_reserve_slots(reserve_fraction, current_level_capacity),
         );
-        let initial_current_level_occupancy = ceil_three_quarters(current_level_capacity);
-        let initial_next_level_occupancy = ceil_three_quarters(next_level_capacity);
+        let initial_current_level_occupancy = capacity::ceil_three_quarters(current_level_capacity);
+        let initial_next_level_occupancy = capacity::ceil_three_quarters(next_level_capacity);
 
         let batch_size = target_current_level_occupancy
             .saturating_sub(initial_current_level_occupancy)
@@ -2154,7 +2159,7 @@ mod tests {
     fn insert_resizes_when_threshold_is_reached() {
         let capacity = 40;
         let mut map = ElasticHashMap::with_capacity(capacity);
-        let max_insertions = max_insertions(capacity, DEFAULT_RESERVE_FRACTION);
+        let max_insertions = capacity::max_insertions(capacity, DEFAULT_RESERVE_FRACTION);
 
         for key in 0..max_insertions + 10 {
             assert_eq!(map.insert(key, key), None);

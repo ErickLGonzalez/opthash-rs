@@ -9,23 +9,18 @@ use std::ptr;
 
 use allocator_api2::boxed::Box as ABox;
 
-use crate::common::config::{DEFAULT_RESERVE_FRACTION, GROUP_SIZE, INITIAL_CAPACITY};
-use crate::common::control::{CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte, ControlOps};
+use crate::common::config::{
+    DEFAULT_RESERVE_FRACTION, GROUP_SIZE, INITIAL_CAPACITY, MAX_FUNNEL_RESERVE_FRACTION,
+};
+use crate::common::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte};
 use crate::common::error::{EntryView, OccupiedError as CommonOccupiedError};
 use crate::common::iter::{
     IntoKeys as CommonIntoKeys, IntoValues as CommonIntoValues, Keys as CommonKeys,
     OccupiedScanner, Values as CommonValues,
 };
-use crate::common::layout::{Entry as SlotEntry, RawTable, try_zeroed_boxed_slice_in};
-use crate::common::math::{
-    capacity_for, ceil_to_usize, fastmod_magic, fastmod_u32, floor_to_usize, level_salt,
-    max_insertions, round_to_usize, round_up_to_group, round_up_to_pow2_groups,
-    sanitize_reserve_fraction, usize_to_f64,
-};
-use crate::common::simd::{ProbeOps, prefetch_read};
+use crate::common::layout::{RawTable, SlotEntry, try_zeroed_boxed_slice_in};
+use crate::common::math::{align, capacity, cast, fastmod, level_salt, probe};
 use crate::common::{Allocator, DefaultHashBuilder, Global, TryReserveError};
-
-pub(crate) const MAX_FUNNEL_RESERVE_FRACTION: f64 = 1.0 / 8.0;
 
 /// Construction-time tuning for `FunnelHashMap`.
 #[derive(Debug, Clone, Copy)]
@@ -105,7 +100,7 @@ impl<K, V, A: Allocator> BucketLevel<K, V, A> {
     fn with_bucket_count_in(bucket_count: usize, bucket_size: usize, salt: u64, alloc: A) -> Self {
         let total_capacity = bucket_count.saturating_mul(bucket_size);
         let bucket_count_magic = if bucket_count > 1 {
-            fastmod_magic(bucket_count)
+            fastmod::fastmod_magic(bucket_count)
         } else {
             0
         };
@@ -129,7 +124,7 @@ impl<K, V, A: Allocator> BucketLevel<K, V, A> {
     ) -> Result<Self, TryReserveError> {
         let total_capacity = bucket_count.saturating_mul(bucket_size);
         let bucket_count_magic = if bucket_count > 1 {
-            fastmod_magic(bucket_count)
+            fastmod::fastmod_magic(bucket_count)
         } else {
             0
         };
@@ -155,7 +150,7 @@ impl<K, V, A: Allocator> BucketLevel<K, V, A> {
     /// salted so each level distributes differently.
     #[inline]
     fn bucket_index(&self, key_hash: u64) -> usize {
-        fastmod_u32(
+        fastmod::fastmod_u32(
             key_hash ^ self.salt,
             self.bucket_count_magic,
             self.bucket_count,
@@ -198,7 +193,7 @@ struct SpecialPrimary<K, V, A: Allocator = Global> {
 
 impl<K, V, A: Allocator + Clone> SpecialPrimary<K, V, A> {
     fn with_capacity_in(capacity: usize, alloc: A) -> Self {
-        let inflated = round_up_to_pow2_groups(capacity);
+        let inflated = align::round_up_to_pow2_groups(capacity);
         let table = RawTable::new_in(inflated, alloc.clone());
         let group_count = table.group_count();
         debug_assert!(
@@ -217,7 +212,7 @@ impl<K, V, A: Allocator + Clone> SpecialPrimary<K, V, A> {
 
     /// Fallible counterpart to [`SpecialPrimary::with_capacity_in`].
     fn try_with_capacity_in(capacity: usize, alloc: A) -> Result<Self, TryReserveError> {
-        let inflated = round_up_to_pow2_groups(capacity);
+        let inflated = align::round_up_to_pow2_groups(capacity);
         let table = RawTable::try_new_in(inflated, alloc.clone())
             .map_err(|()| TryReserveError::AllocError)?;
         let group_count = table.group_count();
@@ -540,16 +535,16 @@ where
     /// across grows.
     #[must_use]
     pub fn with_options_and_hasher_in(options: FunnelOptions, hash_builder: S, alloc: A) -> Self {
-        let reserve_fraction =
-            sanitize_reserve_fraction(options.reserve_fraction).min(MAX_FUNNEL_RESERVE_FRACTION);
+        let reserve_fraction = capacity::sanitize_reserve_fraction(options.reserve_fraction)
+            .min(MAX_FUNNEL_RESERVE_FRACTION);
         let capacity = options.capacity;
-        let max_insertions = max_insertions(capacity, reserve_fraction);
+        let max_insertions = capacity::max_insertions(capacity, reserve_fraction);
 
         let level_count = compute_level_count(reserve_fraction);
-        let bucket_width = round_up_to_group(compute_bucket_width(reserve_fraction));
+        let bucket_width = align::round_up_to_group(compute_bucket_width(reserve_fraction));
         let primary_probe_limit = options
             .primary_probe_limit
-            .unwrap_or_else(|| ProbeOps::log_log_probe_limit(capacity))
+            .unwrap_or_else(|| probe::log_log_probe_limit(capacity))
             .max(1);
 
         let mut special_capacity =
@@ -666,7 +661,7 @@ where
     /// # Panics
     ///
     /// Panics if no representable capacity satisfies
-    /// `max_insertions(cap) >= min_capacity`.
+    /// `capacity::max_insertions(cap) >= min_capacity`.
     pub fn shrink_to(&mut self, min_capacity: usize) {
         if self.len == 0 && min_capacity == 0 {
             if self.capacity > 0 {
@@ -675,7 +670,7 @@ where
             return;
         }
         let lower = self.len.max(min_capacity).max(INITIAL_CAPACITY);
-        let new_capacity = capacity_for(INITIAL_CAPACITY, lower, self.reserve_fraction)
+        let new_capacity = capacity::capacity_for(INITIAL_CAPACITY, lower, self.reserve_fraction)
             .expect("capacity overflow");
         if new_capacity >= self.capacity {
             return;
@@ -687,7 +682,7 @@ where
     /// `needed` live entries. Returns `None` if no representable capacity
     /// suffices.
     fn grow_capacity_for(&self, needed: usize) -> Option<usize> {
-        capacity_for(
+        capacity::capacity_for(
             self.capacity.max(INITIAL_CAPACITY),
             needed,
             self.reserve_fraction,
@@ -699,7 +694,7 @@ where
     /// Panics if a resize succeeds but no free slot can be found for the new key.
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
         let key_hash = self.hash_key(&key);
-        let key_fingerprint = ControlOps::control_fingerprint(key_hash);
+        let key_fingerprint = control::control_fingerprint(key_hash);
 
         let level_candidate =
             match self.find_in_levels_with_candidate(&key, key_hash, key_fingerprint) {
@@ -762,7 +757,7 @@ where
         Q: Hash + Eq + ?Sized,
     {
         let key_hash = self.hash_key(key);
-        let key_fingerprint = ControlOps::control_fingerprint(key_hash);
+        let key_fingerprint = control::control_fingerprint(key_hash);
 
         match self.find_slot_location_with_hash(key, key_hash, key_fingerprint)? {
             SlotLocation::Level {
@@ -785,7 +780,7 @@ where
         Q: Hash + Eq + ?Sized,
     {
         let key_hash = self.hash_key(key);
-        let key_fingerprint = ControlOps::control_fingerprint(key_hash);
+        let key_fingerprint = control::control_fingerprint(key_hash);
 
         let entry = match self.find_slot_location_with_hash(key, key_hash, key_fingerprint)? {
             SlotLocation::Level {
@@ -808,7 +803,7 @@ where
         Q: Hash + Eq + ?Sized,
     {
         let key_hash = self.hash_key(key);
-        let key_fingerprint = ControlOps::control_fingerprint(key_hash);
+        let key_fingerprint = control::control_fingerprint(key_hash);
 
         match self.find_slot_location_with_hash(key, key_hash, key_fingerprint)? {
             SlotLocation::Level {
@@ -839,7 +834,7 @@ where
         let mut locations: [SlotLocation; N] = [SlotLocation::SpecialPrimary { slot_idx: 0 }; N];
         for (i, key) in keys.iter().enumerate() {
             let key_hash = self.hash_key(*key);
-            let key_fingerprint = ControlOps::control_fingerprint(key_hash);
+            let key_fingerprint = control::control_fingerprint(key_hash);
             locations[i] = self.find_slot_location_with_hash(*key, key_hash, key_fingerprint)?;
         }
 
@@ -889,7 +884,7 @@ where
         let mut locations: [SlotLocation; N] = [SlotLocation::SpecialPrimary { slot_idx: 0 }; N];
         for (i, key) in keys.iter().enumerate() {
             let key_hash = self.hash_key(*key);
-            let key_fingerprint = ControlOps::control_fingerprint(key_hash);
+            let key_fingerprint = control::control_fingerprint(key_hash);
             locations[i] = self.find_slot_location_with_hash(*key, key_hash, key_fingerprint)?;
         }
 
@@ -914,7 +909,7 @@ where
         Q: Hash + Eq + ?Sized,
     {
         let key_hash = self.hash_key(key);
-        let key_fingerprint = ControlOps::control_fingerprint(key_hash);
+        let key_fingerprint = control::control_fingerprint(key_hash);
         self.find_slot_location_with_hash(key, key_hash, key_fingerprint)
             .is_some()
     }
@@ -942,7 +937,7 @@ where
         Q: Hash + Eq + ?Sized,
     {
         let key_hash = self.hash_key(key);
-        let key_fingerprint = ControlOps::control_fingerprint(key_hash);
+        let key_fingerprint = control::control_fingerprint(key_hash);
         let location = self.find_slot_location_with_hash(key, key_hash, key_fingerprint)?;
 
         let (removed_entry, needs_resize) = match location {
@@ -1060,7 +1055,7 @@ where
     /// Mirrors [`std::collections::HashMap::entry`].
     pub fn entry(&mut self, key: K) -> Entry<'_, K, V, S, A> {
         let key_hash = self.hash_key(&key);
-        let key_fingerprint = ControlOps::control_fingerprint(key_hash);
+        let key_fingerprint = control::control_fingerprint(key_hash);
         if let Some(location) = self.find_slot_location_with_hash(&key, key_hash, key_fingerprint) {
             Entry::Occupied(OccupiedEntry {
                 map: self,
@@ -1095,7 +1090,7 @@ where
     /// Post-lookup insert for a key known to be absent. Returns the chosen
     /// slot so the caller can borrow into it without re-probing.
     fn insert_for_vacant_entry(&mut self, key: K, value: V, key_hash: u64) -> SlotLocation {
-        let key_fingerprint = ControlOps::control_fingerprint(key_hash);
+        let key_fingerprint = control::control_fingerprint(key_hash);
 
         let mut location = if self.len < self.max_insertions {
             self.choose_slot_for_new_key(key_hash)
@@ -1271,16 +1266,16 @@ where
         hash_builder: S,
         alloc: A,
     ) -> Result<Self, TryReserveError> {
-        let reserve_fraction =
-            sanitize_reserve_fraction(options.reserve_fraction).min(MAX_FUNNEL_RESERVE_FRACTION);
+        let reserve_fraction = capacity::sanitize_reserve_fraction(options.reserve_fraction)
+            .min(MAX_FUNNEL_RESERVE_FRACTION);
         let capacity = options.capacity;
-        let max_insertions = max_insertions(capacity, reserve_fraction);
+        let max_insertions = capacity::max_insertions(capacity, reserve_fraction);
 
         let level_count = compute_level_count(reserve_fraction);
-        let bucket_width = round_up_to_group(compute_bucket_width(reserve_fraction));
+        let bucket_width = align::round_up_to_group(compute_bucket_width(reserve_fraction));
         let primary_probe_limit = options
             .primary_probe_limit
-            .unwrap_or_else(|| ProbeOps::log_log_probe_limit(capacity))
+            .unwrap_or_else(|| probe::log_log_probe_limit(capacity))
             .max(1);
 
         let mut special_capacity =
@@ -1367,7 +1362,7 @@ where
         self.special.fallback.tombstones = 0;
 
         let level_count = compute_level_count(self.reserve_fraction);
-        let bucket_width = round_up_to_group(compute_bucket_width(self.reserve_fraction));
+        let bucket_width = align::round_up_to_group(compute_bucket_width(self.reserve_fraction));
         let mut special_capacity =
             choose_special_capacity(new_capacity, self.reserve_fraction, bucket_width);
         let mut main_capacity = new_capacity.saturating_sub(special_capacity);
@@ -1399,7 +1394,7 @@ where
         self.levels = new_levels;
         self.special = new_special;
         self.capacity = new_capacity;
-        self.max_insertions = max_insertions(new_capacity, self.reserve_fraction);
+        self.max_insertions = capacity::max_insertions(new_capacity, self.reserve_fraction);
         self.max_populated_level = 0;
         self.len = 0;
 
@@ -1421,7 +1416,7 @@ where
     #[inline]
     fn special_primary_group_start(&self, key_hash: u64) -> usize {
         let mask = self.special.primary.group_count_mask;
-        ProbeOps::hash_to_usize(key_hash.rotate_left(11)) & mask
+        probe::hash_to_usize(key_hash.rotate_left(11)) & mask
     }
 
     /// Per-key odd step over the pow2 `group_count`. The `| 1` forces odd ⇒
@@ -1430,17 +1425,17 @@ where
     #[inline]
     fn special_primary_step(&self, key_hash: u64) -> usize {
         let mask = self.special.primary.group_count_mask;
-        (ProbeOps::hash_to_usize(key_hash.rotate_left(43)) | 1) & mask
+        (probe::hash_to_usize(key_hash.rotate_left(43)) | 1) & mask
     }
 
     #[inline]
     fn special_fallback_bucket_a(key_hash: u64, bucket_count: usize) -> usize {
-        ProbeOps::hash_to_usize(key_hash.rotate_left(19)) % bucket_count
+        probe::hash_to_usize(key_hash.rotate_left(19)) % bucket_count
     }
 
     #[inline]
     fn special_fallback_bucket_b(key_hash: u64, bucket_count: usize) -> usize {
-        ProbeOps::hash_to_usize(key_hash.rotate_left(37)) % bucket_count
+        probe::hash_to_usize(key_hash.rotate_left(37)) % bucket_count
     }
 
     #[inline]
@@ -1528,7 +1523,7 @@ where
     #[inline]
     fn insert_new_entry_unchecked(&mut self, key: K, value: V) {
         let key_hash = self.hash_key(&key);
-        let key_fingerprint = ControlOps::control_fingerprint(key_hash);
+        let key_fingerprint = control::control_fingerprint(key_hash);
         let location = self
             .choose_slot_for_new_key(key_hash)
             .expect("resized funnel map should have free slot");
@@ -1595,7 +1590,7 @@ where
                     key_fingerprint,
                 );
                 primary.len += 1;
-                primary.group_summaries[group_idx] |= ControlOps::fingerprint_bit(key_fingerprint);
+                primary.group_summaries[group_idx] |= control::fingerprint_bit(key_fingerprint);
                 if was_tombstone {
                     primary.tombstones -= 1;
                 }
@@ -1708,7 +1703,6 @@ where
             unsafe { std::hint::unreachable_unchecked() };
         }
         let group_idx = bucket_range.start / GROUP_SIZE;
-        // Warm slot data while SIMD scan runs — hides slot-load latency.
         // SAFETY: `level.len > 0` ⇒ `capacity > 0`; `bucket_range.start
         // < capacity` by construction.
         unsafe { level.table.prefetch_slot(bucket_range.start) };
@@ -1805,7 +1799,7 @@ where
             return LookupStep::Continue;
         }
 
-        let fingerprint_mask = ControlOps::fingerprint_bit(key_fingerprint);
+        let fingerprint_mask = control::fingerprint_bit(key_fingerprint);
         let group_count = primary.table.group_count();
         let group_limit = self.primary_probe_limit.min(group_count.max(1));
         let mask = primary.group_count_mask;
@@ -1830,7 +1824,9 @@ where
                 return LookupStep::StopSearch;
             }
             let next = (group_idx + step) & mask;
-            unsafe { prefetch_read(primary.table.group_data_ptr(next)) };
+            // SAFETY: `primary.len > 0` ⇒ `capacity > 0`; `next` is wrapped
+            // by `group_count_mask` so `next < group_count`.
+            unsafe { primary.table.prefetch_group_controls(next) };
             group_idx = next;
         }
         LookupStep::Continue
@@ -1860,7 +1856,7 @@ where
             );
         }
 
-        let fingerprint_mask = ControlOps::fingerprint_bit(key_fingerprint);
+        let fingerprint_mask = control::fingerprint_bit(key_fingerprint);
         let group_count = primary.table.group_count();
         let group_limit = self.primary_probe_limit.min(group_count.max(1));
         let mask = primary.group_count_mask;
@@ -1897,7 +1893,9 @@ where
                 return (LookupStep::StopSearch, candidate);
             }
             let next = (group_idx + step) & mask;
-            unsafe { prefetch_read(primary.table.group_data_ptr(next)) };
+            // SAFETY: `primary.table.capacity() > 0` ⇒ `group_count > 0`;
+            // `next` is wrapped by `group_count_mask` so `next < group_count`.
+            unsafe { primary.table.prefetch_group_controls(next) };
             group_idx = next;
         }
         (LookupStep::Continue, candidate)
@@ -1935,11 +1933,9 @@ where
             };
 
             let mut match_offset = 0;
-            while let Some(relative_idx) = ControlOps::find_next_fingerprint_in_controls(
-                controls,
-                key_fingerprint,
-                match_offset,
-            ) {
+            while let Some(relative_idx) =
+                control::find_next_fingerprint_in_controls(controls, key_fingerprint, match_offset)
+            {
                 let slot_idx = range.start + relative_idx;
                 let entry = unsafe { fallback.table.get_ref(slot_idx) };
                 if entry.key.borrow() == key {
@@ -2964,13 +2960,13 @@ unsafe fn funnel_slot_value_ptr<K, V, A: Allocator + Clone>(
 /// Number of bucket levels for a given reserve fraction. Tighter reserve →
 /// more levels (more probing budget per insert).
 fn compute_level_count(reserve_fraction: f64) -> usize {
-    ceil_to_usize((4.0 * (1.0 / reserve_fraction).log2() + 10.0).max(1.0))
+    cast::ceil_to_usize((4.0 * (1.0 / reserve_fraction).log2() + 10.0).max(1.0))
 }
 
 /// Per-bucket slot count. Wider buckets reduce overflow into deeper levels
 /// at the cost of more in-bucket probing.
 fn compute_bucket_width(reserve_fraction: f64) -> usize {
-    ceil_to_usize((2.0 * (1.0 / reserve_fraction).log2()).max(1.0))
+    cast::ceil_to_usize((2.0 * (1.0 / reserve_fraction).log2()).max(1.0))
 }
 
 /// Carve out the special-array capacity from the total. Returns
@@ -2985,9 +2981,9 @@ fn choose_special_capacity(
         return 0;
     }
 
-    let total_capacity_f64 = usize_to_f64(total_capacity);
-    let lower_bound = ceil_to_usize((reserve_fraction * total_capacity_f64) / 2.0);
-    let upper_bound = floor_to_usize((3.0 * reserve_fraction * total_capacity_f64) / 4.0);
+    let total_capacity_f64 = cast::usize_to_f64(total_capacity);
+    let lower_bound = cast::ceil_to_usize((reserve_fraction * total_capacity_f64) / 2.0);
+    let upper_bound = cast::floor_to_usize((3.0 * reserve_fraction * total_capacity_f64) / 4.0);
     let lower_bound = lower_bound.min(total_capacity);
     let upper_bound = upper_bound.min(total_capacity);
 
@@ -2999,7 +2995,7 @@ fn choose_special_capacity(
         }
     }
 
-    let target = round_to_usize(
+    let target = cast::round_to_usize(
         ((5.0 * reserve_fraction * total_capacity_f64) / 8.0).clamp(0.0, total_capacity_f64),
     );
 
@@ -3033,7 +3029,9 @@ fn partition_funnel_buckets(total_buckets: usize, level_count: usize) -> Vec<usi
         if denom <= 0.0 {
             total_buckets.max(1)
         } else {
-            round_to_usize((((usize_to_f64(total_buckets)) * (1.0 - ratio)) / denom).max(0.0))
+            cast::round_to_usize(
+                (((cast::usize_to_f64(total_buckets)) * (1.0 - ratio)) / denom).max(0.0),
+            )
         }
     };
 
@@ -3215,7 +3213,7 @@ mod tests {
     fn insert_resizes_when_threshold_is_reached() {
         let capacity = 64;
         let mut map = FunnelHashMap::with_capacity(capacity);
-        let max_insertions = max_insertions(capacity, DEFAULT_RESERVE_FRACTION);
+        let max_insertions = capacity::max_insertions(capacity, DEFAULT_RESERVE_FRACTION);
 
         for key in 0..max_insertions + 10 {
             let _ = map.insert(key, key * 10);
@@ -4096,8 +4094,11 @@ mod tests {
         // bypass `remove`, so the per-remove resize check can't fire mid-walk;
         // this test guards that invariant.
         let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(1024);
-        let max = i32::try_from(max_insertions(map.capacity(), DEFAULT_RESERVE_FRACTION))
-            .expect("test capacity fits i32");
+        let max = i32::try_from(capacity::max_insertions(
+            map.capacity(),
+            DEFAULT_RESERVE_FRACTION,
+        ))
+        .expect("test capacity fits i32");
         for i in 0..max {
             map.insert(i, i);
         }

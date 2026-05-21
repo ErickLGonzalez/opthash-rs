@@ -13,7 +13,7 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PySet, PyString, PyTuple, PyType};
 
-use crate::funnel::MAX_FUNNEL_RESERVE_FRACTION;
+use crate::common::config::MAX_FUNNEL_RESERVE_FRACTION;
 use crate::{ElasticHashMap, ElasticOptions, FunnelHashMap, FunnelOptions};
 
 fn build_elastic_options(
@@ -74,6 +74,7 @@ enum HashKind {
     Str = 1,
 }
 
+/// Low-bit tag mask packing a [`HashKind`] into a `PyObject*` pointer.
 const KIND_MASK: usize = 0b1;
 
 /// Owning hashable wrapper for a `Py<PyAny>` map key. Caches `__hash__`

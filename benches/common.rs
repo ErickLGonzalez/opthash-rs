@@ -7,6 +7,7 @@ use std::collections::HashMap as StdHashMap;
 use hashbrown::HashMap as HashbrownMap;
 use opthash::{ElasticHashMap, FunnelHashMap};
 
+/// Map sizes the Criterion latency suite sweeps over.
 pub const LATENCY_SIZES: &[usize] = &[1_000, 10_000, 100_000, 1_000_000, 10_000_000];
 
 /// Knuth multiplicative-hash constant (golden ratio * 2^64, odd).
