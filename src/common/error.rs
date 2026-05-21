@@ -1,6 +1,26 @@
 use std::error::Error;
 use std::fmt;
 
+/// Error returned by `try_reserve` when the map can't grow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TryReserveError {
+    /// Capacity computation overflowed `usize`.
+    CapacityOverflow,
+    /// Allocator failed.
+    AllocError,
+}
+
+impl fmt::Display for TryReserveError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CapacityOverflow => f.write_str("capacity overflow"),
+            Self::AllocError => f.write_str("memory allocation failed"),
+        }
+    }
+}
+
+impl Error for TryReserveError {}
+
 /// Read-only view into an occupied entry. Implemented by each map's
 /// `OccupiedEntry` so the shared `OccupiedError` impls can format key/value.
 /// Method names are prefixed to avoid colliding with the inherent

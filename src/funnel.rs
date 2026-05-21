@@ -11,7 +11,7 @@ use allocator_api2::boxed::Box as ABox;
 
 use crate::common::config::{DEFAULT_RESERVE_FRACTION, GROUP_SIZE, INITIAL_CAPACITY};
 use crate::common::control::{CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte, ControlOps};
-use crate::common::entry::{EntryView, OccupiedError as CommonOccupiedError};
+use crate::common::error::{EntryView, OccupiedError as CommonOccupiedError};
 use crate::common::iter::{
     IntoKeys as CommonIntoKeys, IntoValues as CommonIntoValues, Keys as CommonKeys,
     OccupiedScanner, Values as CommonValues,

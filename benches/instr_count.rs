@@ -194,7 +194,11 @@ op_group!(
     hashbrown = iter_hashbrown(setup = populated_hashbrown),
     elastic = iter_elastic(setup = populated_elastic),
     funnel = iter_funnel(setup = populated_funnel),
-    |map| black_box(map.iter().count())
+    // `iter().count()` is intentional — we measure walking entries, not asking for len.
+    |map| black_box({
+        #[allow(clippy::iter_count)]
+        map.iter().count()
+    })
 );
 
 // ---------------------------------------------------------------------------

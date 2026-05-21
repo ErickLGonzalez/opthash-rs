@@ -8,8 +8,9 @@ use allocator_api2::vec::Vec;
 use super::TryReserveError;
 use super::bitmask::BitMask;
 use super::config::GROUP_SIZE;
+use super::control::{CTRL_EMPTY, CTRL_TOMBSTONE};
 use super::math::round_up_to_group;
-use super::simd::{CTRL_EMPTY, eq_mask_16, free_mask_16};
+use super::simd::{eq_mask_16, free_mask_16};
 
 /// Fallibly allocates a zero-filled `Box<[T], A>` in `alloc`.
 pub(crate) fn try_zeroed_boxed_slice_in<T: Default + Clone, A: Allocator>(
@@ -255,7 +256,7 @@ impl<T, A: Allocator> RawTable<T, A> {
 
     #[inline]
     pub fn mark_tombstone(&mut self, idx: usize) {
-        self.set_control(idx, super::control::CTRL_TOMBSTONE);
+        self.set_control(idx, CTRL_TOMBSTONE);
     }
 
     /// Erase `idx`. Returns `true` if tombstone set; `false` if slot reset to `EMPTY`
@@ -269,7 +270,7 @@ impl<T, A: Allocator> RawTable<T, A> {
             self.set_control(idx, CTRL_EMPTY);
             false
         } else {
-            self.set_control(idx, super::control::CTRL_TOMBSTONE);
+            self.set_control(idx, CTRL_TOMBSTONE);
             true
         }
     }
@@ -355,5 +356,18 @@ impl<T, A: Allocator> RawTable<T, A> {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Global, RawTable};
+
+    #[test]
+    fn group_masks_work_on_full_groups() {
+        let mut table: RawTable<u64> = RawTable::new_in(32, Global);
+        table.set_control(16, 11);
+        assert_eq!(table.group_match_mask(1, 11).lowest(), Some(0));
+        assert!(table.group_free_mask(1).any());
     }
 }

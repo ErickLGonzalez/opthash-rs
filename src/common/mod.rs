@@ -1,7 +1,7 @@
 pub(crate) mod bitmask;
 pub(crate) mod config;
 pub(crate) mod control;
-pub(crate) mod entry;
+pub(crate) mod error;
 pub(crate) mod iter;
 pub(crate) mod layout;
 pub(crate) mod math;
@@ -9,38 +9,6 @@ pub(crate) mod simd;
 
 pub use allocator_api2::alloc::{Allocator, Global};
 
+pub use error::TryReserveError;
+
 pub type DefaultHashBuilder = foldhash::fast::RandomState;
-
-/// Error returned by `try_reserve` when the map can't grow.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TryReserveError {
-    /// Capacity computation overflowed `usize`.
-    CapacityOverflow,
-    /// Allocator failed.
-    AllocError,
-}
-
-impl std::fmt::Display for TryReserveError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::CapacityOverflow => f.write_str("capacity overflow"),
-            Self::AllocError => f.write_str("memory allocation failed"),
-        }
-    }
-}
-
-impl std::error::Error for TryReserveError {}
-
-#[cfg(test)]
-mod tests {
-    use super::Global;
-    use super::layout::RawTable;
-
-    #[test]
-    fn group_masks_work_on_full_groups() {
-        let mut table: RawTable<u64> = RawTable::new_in(32, Global);
-        table.set_control(16, 11);
-        assert_eq!(table.group_match_mask(1, 11).lowest(), Some(0));
-        assert!(table.group_free_mask(1).any());
-    }
-}
