@@ -96,37 +96,6 @@ pub(crate) mod align {
     }
 }
 
-/// Lemire fastmod — precompute a magic once, evaluate `a % d` as a mul-shift.
-pub(crate) mod fastmod {
-    /// Precompute `M = ceil(2^64 / d)`. `d` must be non-zero and fit in `u32`.
-    ///
-    /// # Panics
-    ///
-    /// If `d` does not fit in `u32`.
-    #[inline]
-    #[must_use]
-    pub(crate) fn fastmod_magic(d: usize) -> u64 {
-        let d_u32 = u32::try_from(d).expect("fastmod divisor fits in u32");
-        debug_assert!(d_u32 != 0);
-        (u64::MAX / u64::from(d_u32)).wrapping_add(1)
-    }
-
-    /// `a % d` via the magic from [`fastmod_magic`]. Only the low 32 bits of
-    /// `a` contribute; `d` is the same value originally passed in.
-    #[inline]
-    #[must_use]
-    #[allow(clippy::cast_possible_truncation)]
-    pub(crate) fn fastmod_u32(a: u64, m: u64, d: usize) -> usize {
-        // `d` fits in u32 by `fastmod_magic`'s precondition.
-        let d_u32 = d as u32;
-        let a_lo = a as u32;
-        let lowbits = m.wrapping_mul(u64::from(a_lo));
-        // (lowbits < 2^64) * (d < 2^32) < 2^96, so the >>64 result fits in u32.
-        let result = ((u128::from(lowbits) * u128::from(d_u32)) >> 64) as u32;
-        result as usize
-    }
-}
-
 /// Probe-limit and hash-to-index helpers shared across maps.
 pub(crate) mod probe {
     #[allow(

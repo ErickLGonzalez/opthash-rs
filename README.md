@@ -123,8 +123,8 @@ FunnelHashMap
     Level 1    (same layout, smaller buckets)
     ...
 
-    per-level  len, tombstones, bucket_size, bucket_count,
-               salt, bucket_count_magic
+    per-level  len, tombstones, bucket_size, salt,
+               bucket_count_mask
 
   special: SpecialArray
 
@@ -157,5 +157,3 @@ See [benches/README.md](benches/README.md) for bench target layout, charts, CLI 
 [^foldhash]: `foldhash` crate. <https://crates.io/crates/foldhash>. Default `BuildHasher` (`foldhash::fast::RandomState`) wired up in [`src/common/mod.rs`](https://github.com/aaron-ang/opthash-rs/blob/main/src/common/mod.rs).
 
 [^prefetch2007]: Shimin Chen, Anastassia Ailamaki, Phillip B. Gibbons, Todd C. Mowry. _Improving Hash Join Performance through Prefetching_ (ACM TODS 2007). PDF: <https://www.cs.cmu.edu/~chensm/papers/hashjoin_tods_preliminary.pdf>. Motivates the intra-probe issued one group ahead (see [`src/funnel.rs`](https://github.com/aaron-ang/opthash-rs/blob/main/src/funnel.rs)).
-
-[^fastmod]: Daniel Lemire. _Faster Remainders when the Divisor is a Constant: Beating Compilers and libdivide_ (2019). <https://lemire.me/blog/2019/02/08/faster-remainders-when-the-divisor-is-a-constant-beating-compilers-and-libdivide/>. Algorithm behind `fastmod_magic` / `fastmod_u32` in [`src/common/math.rs`](https://github.com/aaron-ang/opthash-rs/blob/main/src/common/math.rs), used by `BucketLevel::bucket_index` to map a hash to a bucket without a hardware divide.

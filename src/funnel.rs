@@ -19,7 +19,7 @@ use crate::common::iter::{
     OccupiedScanner, Values as CommonValues,
 };
 use crate::common::layout::{RawTable, SlotEntry, try_zeroed_boxed_slice_in};
-use crate::common::math::{align, capacity, cast, fastmod, level_salt, probe};
+use crate::common::math::{align, capacity, cast, level_salt, probe};
 use crate::common::{Allocator, DefaultHashBuilder, Global, TryReserveError};
 
 /// Construction-time tuning for `FunnelHashMap`.
@@ -87,31 +87,28 @@ struct BucketLevel<K, V, A: Allocator = Global> {
     tombstones: usize,
     /// Slots per bucket.
     bucket_size: usize,
-    /// Number of buckets in this level.
-    bucket_count: usize,
-    /// Per-level salt mixed into the key hash
-    /// so each level distributes differently.
+    /// Per-level salt mixed into the key hash so each level distributes differently.
     salt: u64,
-    /// Fastmod magic for `bucket_count`.
-    bucket_count_magic: u64,
+    /// `bucket_count - 1`; `bucket_count` is pow2 so `bucket_index` is `hash & mask`.
+    bucket_count_mask: usize,
 }
 
 impl<K, V, A: Allocator> BucketLevel<K, V, A> {
     fn with_bucket_count_in(bucket_count: usize, bucket_size: usize, salt: u64, alloc: A) -> Self {
-        let total_capacity = bucket_count.saturating_mul(bucket_size);
-        let bucket_count_magic = if bucket_count > 1 {
-            fastmod::fastmod_magic(bucket_count)
-        } else {
+        // Round up to pow2 so `bucket_index` is a mask.
+        let bucket_count = if bucket_count == 0 {
             0
+        } else {
+            bucket_count.next_power_of_two()
         };
+        let total_capacity = bucket_count.saturating_mul(bucket_size);
         Self {
             table: RawTable::new_in(total_capacity, alloc),
             len: 0,
             tombstones: 0,
             bucket_size,
-            bucket_count,
             salt,
-            bucket_count_magic,
+            bucket_count_mask: bucket_count.saturating_sub(1),
         }
     }
 
@@ -122,12 +119,13 @@ impl<K, V, A: Allocator> BucketLevel<K, V, A> {
         salt: u64,
         alloc: A,
     ) -> Result<Self, TryReserveError> {
-        let total_capacity = bucket_count.saturating_mul(bucket_size);
-        let bucket_count_magic = if bucket_count > 1 {
-            fastmod::fastmod_magic(bucket_count)
-        } else {
+        // Round up to pow2 so `bucket_index` is a mask.
+        let bucket_count = if bucket_count == 0 {
             0
+        } else {
+            bucket_count.next_power_of_two()
         };
+        let total_capacity = bucket_count.saturating_mul(bucket_size);
         let table = RawTable::try_new_in(total_capacity, alloc)
             .map_err(|()| TryReserveError::AllocError)?;
         Ok(Self {
@@ -135,9 +133,8 @@ impl<K, V, A: Allocator> BucketLevel<K, V, A> {
             len: 0,
             tombstones: 0,
             bucket_size,
-            bucket_count,
             salt,
-            bucket_count_magic,
+            bucket_count_mask: bucket_count.saturating_sub(1),
         })
     }
 
@@ -146,15 +143,11 @@ impl<K, V, A: Allocator> BucketLevel<K, V, A> {
         self.table.capacity()
     }
 
-    /// Hash → bucket via fastmod,
-    /// salted so each level distributes differently.
+    /// Hash → bucket via pow2 mask, salted so each level distributes differently.
+    #[allow(clippy::cast_possible_truncation)]
     #[inline]
     fn bucket_index(&self, key_hash: u64) -> usize {
-        fastmod::fastmod_u32(
-            key_hash ^ self.salt,
-            self.bucket_count_magic,
-            self.bucket_count,
-        )
+        ((key_hash ^ self.salt) as usize) & self.bucket_count_mask
     }
 
     /// Slot index range covering all entries in `bucket_idx`.
