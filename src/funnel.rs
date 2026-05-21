@@ -1421,9 +1421,6 @@ where
     #[inline]
     fn special_primary_group_start(&self, key_hash: u64) -> usize {
         let mask = self.special.primary.group_count_mask;
-        if mask == 0 {
-            return 0;
-        }
         ProbeOps::hash_to_usize(key_hash.rotate_left(11)) & mask
     }
 
@@ -1617,7 +1614,7 @@ where
     }
 
     fn first_free_in_level_bucket(key_hash: u64, level: &BucketLevel<K, V, A>) -> Option<usize> {
-        if level.len >= level.capacity() || level.bucket_count == 0 {
+        if level.len >= level.capacity() {
             return None;
         }
 
@@ -1660,10 +1657,6 @@ where
         }
 
         let bucket_count = fallback.bucket_count();
-        if bucket_count == 0 {
-            return None;
-        }
-
         let bucket_a = Self::special_fallback_bucket_a(key_hash, bucket_count);
         let bucket_b = Self::special_fallback_bucket_b(key_hash, bucket_count);
 
@@ -1698,7 +1691,7 @@ where
         K: Borrow<Q>,
         Q: Eq + ?Sized,
     {
-        if level.len == 0 || level.bucket_count == 0 {
+        if level.len == 0 {
             return LookupStep::Continue;
         }
 
@@ -1747,10 +1740,6 @@ where
         Q: Eq + ?Sized,
     {
         if level.len == 0 {
-            return (LookupStep::Continue, None);
-        }
-
-        if level.bucket_count == 0 {
             return (LookupStep::Continue, None);
         }
 
@@ -1932,10 +1921,6 @@ where
         }
 
         let bucket_count = fallback.bucket_count();
-        if bucket_count == 0 {
-            return None;
-        }
-
         let bucket_a = Self::special_fallback_bucket_a(key_hash, bucket_count);
         let bucket_b = Self::special_fallback_bucket_b(key_hash, bucket_count);
 
@@ -1988,10 +1973,6 @@ where
         }
 
         let bucket_count = fallback.bucket_count();
-        if bucket_count == 0 {
-            return (None, None);
-        }
-
         let bucket_a = Self::special_fallback_bucket_a(key_hash, bucket_count);
         let bucket_b = Self::special_fallback_bucket_b(key_hash, bucket_count);
         let mut candidate = None;
