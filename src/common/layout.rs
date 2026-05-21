@@ -7,6 +7,7 @@ use allocator_api2::vec::Vec;
 
 use super::TryReserveError;
 use super::bitmask::BitMask;
+use super::config::GROUP_SIZE;
 use super::math::round_up_to_group;
 use super::simd::{CTRL_EMPTY, eq_mask_16, free_mask_16};
 
@@ -21,8 +22,6 @@ pub(crate) fn try_zeroed_boxed_slice_in<T: Default + Clone, A: Allocator>(
     buf.resize(len, T::default());
     Ok(buf.into_boxed_slice())
 }
-
-pub(crate) const GROUP_SIZE: usize = 16;
 
 /// Alignment for the control-byte region. Matches 64-byte cache lines so
 /// the first group is line-aligned and groups pack 4-per-line without splits.
@@ -43,9 +42,9 @@ pub(crate) struct Entry<K, V> {
 /// a fixed offset after the slots, accessed via `ctrl_ptr()`.
 pub(crate) struct RawTable<T, A: Allocator = Global> {
     data_ptr: NonNull<u8>,
+    ctrl_ptr: NonNull<u8>,
     capacity: usize,
     group_count: usize,
-    ctrl_offset: usize,
     alloc: A,
     _marker: PhantomData<T>,
 }
@@ -88,12 +87,15 @@ impl<T, A: Allocator> RawTable<T, A> {
             .allocate_zeroed(layout)
             .unwrap_or_else(|_| handle_alloc_error(layout))
             .cast::<u8>();
+        // SAFETY: `ctrl_offset` is within the allocation produced for `layout`.
+        let ctrl_raw = unsafe { data_ptr.as_ptr().add(ctrl_offset) };
+        let ctrl_ptr = NonNull::new(ctrl_raw).expect("ctrl_ptr is data_ptr + offset, non-null");
 
         Self {
             data_ptr,
+            ctrl_ptr,
             capacity,
             group_count,
-            ctrl_offset,
             alloc,
             _marker: PhantomData,
         }
@@ -111,12 +113,15 @@ impl<T, A: Allocator> RawTable<T, A> {
         let (layout, ctrl_offset) = Self::try_unified_layout(capacity, group_count).ok_or(())?;
 
         let data_ptr = alloc.allocate_zeroed(layout).map_err(|_| ())?.cast::<u8>();
+        // SAFETY: `ctrl_offset` is within the allocation produced for `layout`.
+        let ctrl_raw = unsafe { data_ptr.as_ptr().add(ctrl_offset) };
+        let ctrl_ptr = NonNull::new(ctrl_raw).expect("ctrl_ptr is data_ptr + offset, non-null");
 
         Ok(Self {
             data_ptr,
+            ctrl_ptr,
             capacity,
             group_count,
-            ctrl_offset,
             alloc,
             _marker: PhantomData,
         })
@@ -126,9 +131,9 @@ impl<T, A: Allocator> RawTable<T, A> {
     fn empty_in(alloc: A) -> Self {
         Self {
             data_ptr: NonNull::dangling(),
+            ctrl_ptr: NonNull::dangling(),
             capacity: 0,
             group_count: 0,
-            ctrl_offset: 0,
             alloc,
             _marker: PhantomData,
         }
@@ -168,7 +173,7 @@ impl<T, A: Allocator> RawTable<T, A> {
 
     #[inline]
     fn ctrl_ptr(&self) -> *mut u8 {
-        unsafe { self.data_ptr.as_ptr().add(self.ctrl_offset) }
+        self.ctrl_ptr.as_ptr()
     }
 
     #[inline]
@@ -183,16 +188,52 @@ impl<T, A: Allocator> RawTable<T, A> {
 
     #[inline]
     pub fn group_data_ptr(&self, group_idx: usize) -> *const u8 {
+        debug_assert!(
+            group_idx < self.group_count,
+            "group_data_ptr: group_idx {group_idx} >= group_count {}",
+            self.group_count
+        );
         unsafe { self.ctrl_ptr().add(group_idx * GROUP_SIZE) }
+    }
+
+    /// Prefetch the cache line for slot `idx`. Call before a probable
+    /// `get_ref(idx)` to overlap memory latency with the fingerprint scan.
+    ///
+    /// # Safety
+    ///
+    /// `capacity > 0 && idx < capacity`. Empty tables hold a dangling
+    /// `data_ptr` — any `.add(idx)` on it would be UB.
+    #[inline]
+    pub(crate) unsafe fn prefetch_slot(&self, idx: usize) {
+        debug_assert!(self.capacity > 0, "prefetch_slot: empty table");
+        debug_assert!(
+            idx < self.capacity,
+            "prefetch_slot: idx {idx} >= capacity {}",
+            self.capacity
+        );
+        // SAFETY: caller upholds `capacity > 0` and `idx < capacity`.
+        unsafe {
+            super::simd::prefetch_read(self.slots_ptr().add(idx).cast::<u8>());
+        }
     }
 
     #[inline]
     pub fn control_at(&self, idx: usize) -> u8 {
+        debug_assert!(
+            idx < self.capacity,
+            "control_at: idx {idx} >= capacity {}",
+            self.capacity
+        );
         unsafe { *self.ctrl_ptr().add(idx) }
     }
 
     #[inline]
     pub fn write(&mut self, idx: usize, value: T) {
+        debug_assert!(
+            idx < self.capacity,
+            "write: idx {idx} >= capacity {}",
+            self.capacity
+        );
         unsafe { self.slots_ptr().add(idx).write(value) };
     }
 
@@ -204,6 +245,11 @@ impl<T, A: Allocator> RawTable<T, A> {
 
     #[inline]
     pub fn set_control(&mut self, idx: usize, new_control: u8) {
+        debug_assert!(
+            idx < self.capacity,
+            "set_control: idx {idx} >= capacity {}",
+            self.capacity
+        );
         unsafe { *self.ctrl_ptr().add(idx) = new_control };
     }
 
@@ -240,32 +286,62 @@ impl<T, A: Allocator> RawTable<T, A> {
 
     #[inline]
     pub unsafe fn get_ref(&self, idx: usize) -> &T {
+        debug_assert!(
+            idx < self.capacity,
+            "get_ref: idx {idx} >= capacity {}",
+            self.capacity
+        );
         unsafe { &*self.slots_ptr().add(idx) }
     }
 
     #[inline]
     pub unsafe fn get_mut(&mut self, idx: usize) -> &mut T {
+        debug_assert!(
+            idx < self.capacity,
+            "get_mut: idx {idx} >= capacity {}",
+            self.capacity
+        );
         unsafe { &mut *self.slots_ptr().add(idx) }
     }
 
     #[inline]
     pub unsafe fn take(&mut self, idx: usize) -> T {
+        debug_assert!(
+            idx < self.capacity,
+            "take: idx {idx} >= capacity {}",
+            self.capacity
+        );
         unsafe { self.slots_ptr().add(idx).read() }
     }
 
     #[inline]
     pub unsafe fn drop_in_place(&mut self, idx: usize) {
+        debug_assert!(
+            idx < self.capacity,
+            "drop_in_place: idx {idx} >= capacity {}",
+            self.capacity
+        );
         unsafe { ptr::drop_in_place(self.slots_ptr().add(idx)) }
     }
 
     #[inline]
     pub fn group_match_mask(&self, group_idx: usize, target: u8) -> BitMask {
+        debug_assert!(
+            group_idx < self.group_count,
+            "group_match_mask: group_idx {group_idx} >= group_count {}",
+            self.group_count
+        );
         let ptr = unsafe { self.ctrl_ptr().add(group_idx * GROUP_SIZE) };
         unsafe { eq_mask_16(ptr, target) }
     }
 
     #[inline]
     pub fn group_free_mask(&self, group_idx: usize) -> BitMask {
+        debug_assert!(
+            group_idx < self.group_count,
+            "group_free_mask: group_idx {group_idx} >= group_count {}",
+            self.group_count
+        );
         let ptr = unsafe { self.ctrl_ptr().add(group_idx * GROUP_SIZE) };
         unsafe { free_mask_16(ptr) }
     }
