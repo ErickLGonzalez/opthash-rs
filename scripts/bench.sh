@@ -61,7 +61,10 @@ claim_perf_core() {
 	for c in "${perf_cores[@]}"; do
 		lock="$LOCK_DIR/core-${c}.lock"
 		# Permission-denied (e.g. lock owned by another user) → try next core.
-		exec {LOCK_FD}>"$lock" 2>/dev/null || continue
+		if ! (exec {fd}>"$lock") 2>/dev/null; then
+			continue
+		fi
+		exec {LOCK_FD}>"$lock"
 		if flock -n "$LOCK_FD"; then
 			CORE=$c
 			echo "info: claimed perf core $c (lock: $lock)" >&2
