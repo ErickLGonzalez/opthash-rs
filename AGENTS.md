@@ -81,12 +81,29 @@ When spawning a worktree, name its branch after the work (e.g. `feat/std-parity-
 
 ## Refactoring guidelines
 
+### Where things live
+
 - Low-level helpers used by both the library and benchmarks live in `src/common/` (bitmask, simd, layout, math). Benches pull fixtures from `benches/common.rs`. Don't duplicate primitives across `src/` and `benches/`.
-- Prefer layout and locality wins before adding more metadata.
-- Keep hot metadata contiguous. If fields are read together, store them together.
-- Avoid metadata that is expensive to maintain on every insert or delete unless benchmarks prove it wins overall.
-- Cache routing state that is reused in hot paths. Do not recompute it per probe.
-- Preserve SIMD-friendly control-byte scans: contiguous groups, cheap bitmask iteration, and early rejection before touching payloads.
-- Reject optimizations that improve only microbenchmarks but regress the public `throughput` suite.
-- Profile hot functions before and after changes. In this repo, focus on `find_slot_indices_with_hash` / `find_in_level_by_probe` (elastic), `find_slot_location_with_hash` / `find_in_level_bucket` (funnel), `group_probe_params`, `choose_slot_for_new_key`, and the resize paths.
-- Use `target/criterion/` as the final gate. If the relevant benchmark regresses, the optimization does not stay.
+
+### Design priorities
+
+- Prefer layout and locality wins before adding more metadata. Keep hot metadata contiguous — if fields are read together, store them together.
+- Cache routing state that's reused in hot paths; never recompute it per probe.
+- Preserve SIMD-friendly control-byte scans: contiguous groups, cheap bitmask iteration, early rejection before touching payloads.
+- Treat values that are constant by construction as constants. Storing them as runtime fields costs a load + mul per probe that LLVM can't fold away.
+
+### Reject
+
+- Metadata that costs work on every insert/delete unless benchmarks prove a net win.
+- Optimizations that improve a microbenchmark but regress the public `throughput` suite. `target/criterion/` is the final gate — if the relevant benchmark regresses, the change does not stay.
+
+### Bench methodology
+
+- Re-save `ref` whenever a fixture constant changes (`HIT_LOOKUP_COUNT`, `MIXED_OP_COUNT`, etc.). Comparing across different workloads makes the `change/` deltas meaningless.
+- Rebuild before reading callgrind output. Stale binaries silently report pre-change asm — check binary mtime against the commit you intend to measure.
+
+### Verify before refactor
+
+- Read the asm (`objdump -d`) on hot functions before factoring shared SIMD or arithmetic primitives. LLVM already CSEs same-pointer control-byte loads and folds duplicate masks; a "cleaner" abstraction may save nothing.
+- Adding a field to a hot struct (`RawTable`, `Level`) is a layout change. Downstream fields can shift across cache lines and regress lookups 15–20% with no semantic change. Measure offsets _and_ bench.
+- Pure refactors (rename, extract, no logic change) can swing 5–50% from icache and branch-predictor layout shifts. A no-op refactor should leave `cargo bench --bench instr_count` IR at ±0.
