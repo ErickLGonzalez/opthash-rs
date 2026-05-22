@@ -20,8 +20,6 @@ IMPL_LABELS = {
     "elastic": "ElasticHashMap",
     "funnel": "FunnelHashMap",
 }
-IMPL_MARKERS = {"std": "o", "hashbrown": "v", "elastic": "s", "funnel": "D"}
-
 _PAIRED = plt.get_cmap("Paired").colors
 IMPL_COLORS = {
     "std": mcolors.to_hex(_PAIRED[0]),  # light blue   (baseline)

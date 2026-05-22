@@ -9,7 +9,6 @@ from _plot_common import (
     IMPL_COLORS,
     IMPLEMENTATIONS,
     IMPL_LABELS,
-    IMPL_MARKERS,
     LATENCY_SIZES,
     apply_axis_style,
     load_criterion_mean_ns,
@@ -52,10 +51,8 @@ def plot_mean_latency_by_size(assets_dir: Path) -> None:
         ax.plot(
             x,
             means[impl],
-            marker=IMPL_MARKERS[impl],
             color=IMPL_COLORS[impl],
             linewidth=2,
-            markersize=7,
             label=IMPL_LABELS[impl],
         )
 
@@ -118,10 +115,7 @@ def plot_tail_cdf(assets_dir: Path) -> None:
         ax.plot(
             x,
             y,
-            marker=IMPL_MARKERS[impl],
             color=IMPL_COLORS[impl],
-            markersize=4,
-            markevery=max(1, len(x) // 20),
             linewidth=2,
             label=IMPL_LABELS[impl],
         )
