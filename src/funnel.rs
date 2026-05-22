@@ -85,30 +85,30 @@ struct BucketLevel<K, V, A: Allocator = Global> {
     len: usize,
     /// Deleted-slot count.
     tombstones: usize,
-    /// Slots per bucket.
-    bucket_size: usize,
     /// Per-level salt mixed into the key hash so each level distributes differently.
     salt: u64,
     /// `bucket_count - 1`; `bucket_count` is pow2 so `bucket_index` is `hash & mask`.
     bucket_count_mask: usize,
+    /// `bucket_size` is pow2 so `bucket_idx * bucket_size` is `bucket_idx << bucket_size_log2`.
+    bucket_size_log2: u32,
 }
 
 impl<K, V, A: Allocator> BucketLevel<K, V, A> {
     fn with_bucket_count_in(bucket_count: usize, bucket_size: usize, salt: u64, alloc: A) -> Self {
-        // Round up to pow2 so `bucket_index` is a mask.
         let bucket_count = if bucket_count == 0 {
             0
         } else {
             bucket_count.next_power_of_two()
         };
+        let bucket_size = bucket_size.next_power_of_two();
         let total_capacity = bucket_count.saturating_mul(bucket_size);
         Self {
             table: RawTable::new_in(total_capacity, alloc),
             len: 0,
             tombstones: 0,
-            bucket_size,
             salt,
             bucket_count_mask: bucket_count.saturating_sub(1),
+            bucket_size_log2: bucket_size.trailing_zeros(),
         }
     }
 
@@ -119,12 +119,12 @@ impl<K, V, A: Allocator> BucketLevel<K, V, A> {
         salt: u64,
         alloc: A,
     ) -> Result<Self, TryReserveError> {
-        // Round up to pow2 so `bucket_index` is a mask.
         let bucket_count = if bucket_count == 0 {
             0
         } else {
             bucket_count.next_power_of_two()
         };
+        let bucket_size = bucket_size.next_power_of_two();
         let total_capacity = bucket_count.saturating_mul(bucket_size);
         let table = RawTable::try_new_in(total_capacity, alloc)
             .map_err(|()| TryReserveError::AllocError)?;
@@ -132,9 +132,9 @@ impl<K, V, A: Allocator> BucketLevel<K, V, A> {
             table,
             len: 0,
             tombstones: 0,
-            bucket_size,
             salt,
             bucket_count_mask: bucket_count.saturating_sub(1),
+            bucket_size_log2: bucket_size.trailing_zeros(),
         })
     }
 
@@ -153,8 +153,9 @@ impl<K, V, A: Allocator> BucketLevel<K, V, A> {
     /// Slot index range covering all entries in `bucket_idx`.
     #[inline]
     fn bucket_range(&self, bucket_idx: usize) -> Range<usize> {
-        let start = bucket_idx * self.bucket_size;
-        start..start + self.bucket_size
+        let start = bucket_idx << self.bucket_size_log2;
+        let size = 1 << self.bucket_size_log2;
+        start..start + size
     }
 }
 
@@ -178,7 +179,8 @@ struct SpecialPrimary<K, V, A: Allocator = Global> {
     len: usize,
     /// Total tombstones; drives the global 50%-capacity resize trigger.
     tombstones: usize,
-    /// `group_count - 1`. Pow2 by construction.
+    /// `group_count - 1`. `group_count` is pow2 by construction,
+    ///  so `(idx + step) & mask` wraps in one op.
     group_count_mask: usize,
     /// Per-group packed fingerprint metadata for fast scans.
     group_summaries: ABox<[u128], A>,
@@ -230,10 +232,9 @@ impl<K, V, A: Allocator> Drop for SpecialPrimary<K, V, A> {
     }
 }
 
-/// Last-resort table for keys that exhaust the special primary's probe
-/// budget. Bucketed like `BucketLevel` but with larger buckets (`2 *
-/// primary_probe_limit`) so a key that's been pushed this far almost
-/// certainly fits.
+/// Last-resort table for keys that exhaust the special primary's probe budget.
+/// Bucketed like `BucketLevel` but with larger buckets (`2 * primary_probe_limit`)
+/// so a key that's been pushed this far almost certainly fits.
 struct SpecialFallback<K, V, A: Allocator = Global> {
     /// Structure of Arrays control bytes + entries.
     table: RawTable<SlotEntry<K, V>, A>,
@@ -241,15 +242,15 @@ struct SpecialFallback<K, V, A: Allocator = Global> {
     len: usize,
     /// Deleted-slot count.
     tombstones: usize,
-    /// Slots per bucket. Larger than `BucketLevel` (`2 * primary_probe_limit`)
-    /// since this is the last-resort table.
-    bucket_size: usize,
     /// Number of buckets.
     bucket_count: usize,
+    /// `bucket_size` is pow2 so `bucket_idx * bucket_size` is `bucket_idx << bucket_size_log2`.
+    bucket_size_log2: u32,
 }
 
 impl<K, V, A: Allocator> SpecialFallback<K, V, A> {
     fn with_capacity_in(capacity: usize, bucket_size: usize, alloc: A) -> Self {
+        let bucket_size = bucket_size.next_power_of_two();
         let bucket_count = if bucket_size == 0 {
             0
         } else {
@@ -259,8 +260,8 @@ impl<K, V, A: Allocator> SpecialFallback<K, V, A> {
             table: RawTable::new_in(capacity, alloc),
             len: 0,
             tombstones: 0,
-            bucket_size,
             bucket_count,
+            bucket_size_log2: bucket_size.trailing_zeros(),
         }
     }
 
@@ -270,6 +271,7 @@ impl<K, V, A: Allocator> SpecialFallback<K, V, A> {
         bucket_size: usize,
         alloc: A,
     ) -> Result<Self, TryReserveError> {
+        let bucket_size = bucket_size.next_power_of_two();
         let bucket_count = if bucket_size == 0 {
             0
         } else {
@@ -281,8 +283,8 @@ impl<K, V, A: Allocator> SpecialFallback<K, V, A> {
             table,
             len: 0,
             tombstones: 0,
-            bucket_size,
             bucket_count,
+            bucket_size_log2: bucket_size.trailing_zeros(),
         })
     }
 
@@ -298,8 +300,9 @@ impl<K, V, A: Allocator> SpecialFallback<K, V, A> {
 
     #[inline]
     fn bucket_range(&self, bucket_idx: usize) -> Range<usize> {
-        let start = bucket_idx * self.bucket_size;
-        let end = (start + self.bucket_size).min(self.table.capacity());
+        let start = bucket_idx << self.bucket_size_log2;
+        let size = 1 << self.bucket_size_log2;
+        let end = (start + size).min(self.table.capacity());
         start..end
     }
 }
