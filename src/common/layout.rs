@@ -3,7 +3,6 @@ use std::ptr::{self, NonNull};
 
 use allocator_api2::alloc::{Allocator, Global, Layout, handle_alloc_error};
 use allocator_api2::boxed::Box;
-use allocator_api2::vec::Vec;
 
 use super::TryReserveError;
 use super::bitmask::BitMask;
@@ -362,16 +361,16 @@ impl<T, A: Allocator> RawTable<T, A> {
     }
 }
 
-/// Fallibly allocates a zero-filled `Box<[T], A>` in `alloc`.
-pub(crate) fn try_zeroed_boxed_slice_in<T: Default + Clone, A: Allocator>(
+/// Fallibly allocates a zero-filled `Box<[T], A>`.
+/// Caller must ensure all-zero bytes are a valid value for `T`.
+pub(crate) fn try_zeroed_boxed_slice_in<T, A: Allocator>(
     len: usize,
     alloc: A,
 ) -> Result<Box<[T], A>, TryReserveError> {
-    let mut buf: Vec<T, A> = Vec::new_in(alloc);
-    buf.try_reserve_exact(len)
+    let uninit = Box::<[T], A>::try_new_zeroed_slice_in(len, alloc)
         .map_err(|_| TryReserveError::AllocError)?;
-    buf.resize(len, T::default());
-    Ok(buf.into_boxed_slice())
+    // SAFETY: zero-initialized buffer; doc bounds `T` to zero-valid types.
+    Ok(unsafe { uninit.assume_init() })
 }
 
 #[cfg(test)]
