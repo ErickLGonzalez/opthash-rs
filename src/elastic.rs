@@ -351,7 +351,7 @@ where
         let max_insertions = capacity::max_insertions(capacity, reserve_fraction);
 
         let level_capacities = partition_levels(capacity);
-        let levels = level_capacities
+        let levels: Vec<Level<K, V, A>> = level_capacities
             .iter()
             .enumerate()
             .map(|(level_idx, &cap)| {
@@ -363,7 +363,7 @@ where
                     alloc.clone(),
                 )
             })
-            .collect::<Vec<_>>();
+            .collect();
 
         let batch_plan = build_batch_plan(&level_capacities, reserve_fraction, max_insertions);
         let batch_remaining = batch_plan.first().copied().unwrap_or(0);
@@ -1497,7 +1497,7 @@ where
         }
 
         let level_capacities = partition_levels(new_capacity);
-        let new_levels = level_capacities
+        let new_levels: Vec<Level<K, V, A>> = level_capacities
             .iter()
             .enumerate()
             .map(|(level_idx, &cap)| {
@@ -1509,7 +1509,7 @@ where
                     self.alloc.clone(),
                 )
             })
-            .collect::<Vec<_>>();
+            .collect();
         let new_max_insertions = capacity::max_insertions(new_capacity, self.reserve_fraction);
         let new_batch_plan =
             build_batch_plan(&level_capacities, self.reserve_fraction, new_max_insertions);
@@ -2352,9 +2352,7 @@ mod tests {
     fn get_disjoint_mut_zero_keys_is_some_empty() {
         let mut map: ElasticHashMap<i32, i32> = ElasticHashMap::with_capacity(16);
         map.insert(1, 1);
-        let got: [&mut i32; 0] = map
-            .get_disjoint_mut::<i32, 0>([])
-            .expect("zero-key returns Some");
+        let got: [&mut i32; 0] = map.get_disjoint_mut([]).expect("zero-key returns Some");
         assert_eq!(got.len(), 0);
     }
 

@@ -367,8 +367,8 @@ pub(crate) fn try_zeroed_boxed_slice_in<T, A: Allocator>(
     len: usize,
     alloc: A,
 ) -> Result<Box<[T], A>, TryReserveError> {
-    let uninit = Box::<[T], A>::try_new_zeroed_slice_in(len, alloc)
-        .map_err(|_| TryReserveError::AllocError)?;
+    let uninit =
+        Box::try_new_zeroed_slice_in(len, alloc).map_err(|_| TryReserveError::AllocError)?;
     // SAFETY: zero-initialized buffer; doc bounds `T` to zero-valid types.
     Ok(unsafe { uninit.assume_init() })
 }

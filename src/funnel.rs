@@ -209,7 +209,7 @@ impl<K, V, A: Allocator + Clone> SpecialPrimary<K, V, A> {
         let table = RawTable::try_new_in(inflated, alloc.clone())
             .map_err(|()| TryReserveError::AllocError)?;
         let group_count = table.group_count();
-        let group_summaries = try_zeroed_boxed_slice_in::<u128, _>(group_count, alloc)?;
+        let group_summaries = try_zeroed_boxed_slice_in(group_count, alloc)?;
         Ok(Self {
             table,
             len: 0,
@@ -551,7 +551,7 @@ where
 
         let total_main_buckets = main_capacity.checked_div(bucket_width).unwrap_or(0);
         let level_bucket_counts = partition_funnel_buckets(total_main_buckets, level_count);
-        let levels = level_bucket_counts
+        let levels: Vec<BucketLevel<K, V, A>> = level_bucket_counts
             .into_iter()
             .enumerate()
             .map(|(level_idx, bucket_count)| {
@@ -562,7 +562,7 @@ where
                     alloc.clone(),
                 )
             })
-            .collect::<Vec<_>>();
+            .collect();
 
         let special =
             SpecialArray::with_capacity_in(special_capacity, primary_probe_limit, alloc.clone());
@@ -1366,7 +1366,7 @@ where
         }
         let total_main_buckets = main_capacity.checked_div(bucket_width).unwrap_or(0);
         let level_bucket_counts = partition_funnel_buckets(total_main_buckets, level_count);
-        let new_levels = level_bucket_counts
+        let new_levels: Vec<BucketLevel<K, V, A>> = level_bucket_counts
             .into_iter()
             .enumerate()
             .map(|(level_idx, bucket_count)| {
@@ -1377,7 +1377,7 @@ where
                     self.alloc.clone(),
                 )
             })
-            .collect::<Vec<_>>();
+            .collect();
         let new_special = SpecialArray::with_capacity_in(
             special_capacity,
             self.primary_probe_limit,
@@ -3144,7 +3144,7 @@ mod tests {
         // "covers at least the request, bounded inflation".
         let capacity = 257;
         let map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(capacity);
-        let level_capacity = map.levels.iter().map(BucketLevel::capacity).sum::<usize>();
+        let level_capacity: usize = map.levels.iter().map(BucketLevel::capacity).sum();
         let special_capacity =
             map.special.primary.table.capacity() + map.special.fallback.table.capacity();
         let total = level_capacity + special_capacity;
@@ -3444,9 +3444,7 @@ mod tests {
     fn get_disjoint_mut_zero_keys_is_some_empty() {
         let mut map: FunnelHashMap<i32, i32> = FunnelHashMap::with_capacity(16);
         map.insert(1, 1);
-        let got: [&mut i32; 0] = map
-            .get_disjoint_mut::<i32, 0>([])
-            .expect("zero-key returns Some");
+        let got: [&mut i32; 0] = map.get_disjoint_mut([]).expect("zero-key returns Some");
         assert_eq!(got.len(), 0);
     }
 

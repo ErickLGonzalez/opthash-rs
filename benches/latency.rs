@@ -37,7 +37,7 @@ fn measure_clock_overhead_ns() -> u64 {
 }
 
 fn new_hist() -> Histogram<u64> {
-    Histogram::<u64>::new_with_bounds(1, 1_000_000_000, 3).expect("valid hdr bounds")
+    Histogram::new_with_bounds(1, 1_000_000_000, 3).expect("valid hdr bounds")
 }
 
 fn scatter(i: usize, n: usize) -> usize {

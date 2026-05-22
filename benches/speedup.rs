@@ -92,10 +92,10 @@ fn bench_insert_throughput(c: &mut Criterion) {
     bench_all_impls!(
         group,
         BatchSize::PerIteration,
-        || StdHashMap::<u64, u64>::with_capacity(INSERT_COUNT * 2),
-        || HashbrownMap::<u64, u64>::with_capacity(INSERT_COUNT * 2),
-        || ElasticHashMap::<u64, u64>::with_capacity(INSERT_COUNT * 2),
-        || FunnelHashMap::<u64, u64>::with_capacity(INSERT_COUNT * 2),
+        || StdHashMap::with_capacity(INSERT_COUNT * 2),
+        || HashbrownMap::with_capacity(INSERT_COUNT * 2),
+        || ElasticHashMap::with_capacity(INSERT_COUNT * 2),
+        || FunnelHashMap::with_capacity(INSERT_COUNT * 2),
         |map| {
             for &(key, value) in &pairs {
                 map.insert(black_box(key), black_box(value));
@@ -231,10 +231,10 @@ fn bench_resize_heavy_throughput(c: &mut Criterion) {
     bench_all_impls!(
         group,
         BatchSize::PerIteration,
-        StdHashMap::<u64, u64>::new,
-        HashbrownMap::<u64, u64>::new,
-        ElasticHashMap::<u64, u64>::new,
-        FunnelHashMap::<u64, u64>::new,
+        StdHashMap::new,
+        HashbrownMap::new,
+        ElasticHashMap::new,
+        FunnelHashMap::new,
         |map| {
             for &(key, value) in &pairs {
                 black_box(map.insert(black_box(key), black_box(value)));
