@@ -110,9 +110,17 @@ def plot_speedup(means: dict[str, dict[str, float]], assets_dir: Path) -> None:
     save_svg(fig, assets_dir / "benchmark-python-speedup.svg")
 
 
+def plot_python_speedup(assets_dir: Path) -> None:
+    if not BENCHMARKS_JSON.exists():
+        rel = BENCHMARKS_JSON.relative_to(ROOT)
+        print(f"skipped python chart: {rel} not found")
+        return
+
+    plot_speedup(load_means(BENCHMARKS_JSON), assets_dir)
+
+
 def main() -> None:
-    means = load_means(BENCHMARKS_JSON)
-    plot_speedup(means, ASSETS_DIR)
+    plot_python_speedup(ASSETS_DIR)
 
 
 if __name__ == "__main__":
