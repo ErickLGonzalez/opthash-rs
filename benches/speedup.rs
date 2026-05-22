@@ -48,28 +48,16 @@ impl Profiler for FlamegraphProfiler {
     }
 }
 
-/// Items inserted per iteration of `insert_throughput`.
-const INSERT_COUNT: usize = 100_000;
-/// Pre-populated map size for the lookup throughput suite.
-const LOOKUP_MAP_SIZE: usize = 20_000;
-/// `get_hit_throughput` lookups per iteration.
-const HIT_LOOKUP_COUNT: usize = 100_000;
-/// `get_miss_throughput` lookups per iteration.
-const MISS_LOOKUP_COUNT: usize = 100_000;
-/// Map size for `tiny_lookup_throughput` — fits comfortably in L1.
+/// Pre-populated map size for the throughput benches.
+const MAP_SIZE: usize = 20_000;
+/// Ops per iteration for throughput benches.
+const OP_COUNT: usize = 100_000;
+/// Tiny map size — fits comfortably in L1.
 const TINY_MAP_SIZE: usize = 32;
-/// `tiny_lookup_throughput` lookups per iteration.
-const TINY_LOOKUP_COUNT: usize = 500_000;
-/// Pre-populated map size for `delete_heavy_throughput`.
-const DELETE_MAP_SIZE: usize = 12_000;
-/// Delete + reinsert ops per iteration of `delete_heavy_throughput`.
-const DELETE_OP_COUNT: usize = 50_000;
+///  Tiny map bench lookups per iteration.
+const TINY_OP_COUNT: usize = 500_000;
 /// Inserts per iteration of `resize_heavy_throughput`; triggers multiple resizes.
 const RESIZE_INSERT_COUNT: usize = 8_000;
-/// Pre-populated map size for `mixed_throughput`.
-const MIXED_MAP_SIZE: usize = 20_000;
-/// Mixed-op (insert/get/delete) count per iteration of `mixed_throughput`.
-const MIXED_OP_COUNT: usize = 100_000;
 
 /// Emits per-impl `bench_function` blocks
 macro_rules! bench_all_impls {
@@ -85,17 +73,17 @@ macro_rules! bench_all_impls {
 }
 
 fn bench_insert_throughput(c: &mut Criterion) {
-    let pairs = make_pairs(INSERT_COUNT);
+    let pairs = make_pairs(OP_COUNT);
     let mut group = c.benchmark_group("insert_throughput");
-    group.throughput(Throughput::Elements(INSERT_COUNT as u64));
+    group.throughput(Throughput::Elements(OP_COUNT as u64));
 
     bench_all_impls!(
         group,
         BatchSize::PerIteration,
-        || StdHashMap::with_capacity(INSERT_COUNT * 2),
-        || HashbrownMap::with_capacity(INSERT_COUNT * 2),
-        || ElasticHashMap::with_capacity(INSERT_COUNT * 2),
-        || FunnelHashMap::with_capacity(INSERT_COUNT * 2),
+        || StdHashMap::with_capacity(OP_COUNT * 2),
+        || HashbrownMap::with_capacity(OP_COUNT * 2),
+        || ElasticHashMap::with_capacity(OP_COUNT * 2),
+        || FunnelHashMap::with_capacity(OP_COUNT * 2),
         |map| {
             for &(key, value) in &pairs {
                 map.insert(black_box(key), black_box(value));
@@ -107,46 +95,83 @@ fn bench_insert_throughput(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_lookup_workload(c: &mut Criterion, name: &str, pairs: &[(u64, u64)], query_keys: &[u64]) {
+fn bench_one_lookup_group(
+    c: &mut Criterion,
+    name: &str,
+    query_keys: &[u64],
+    std_map: &StdHashMap<u64, u64>,
+    hb_map: &HashbrownMap<u64, u64>,
+    el_map: &ElasticHashMap<u64, u64>,
+    fn_map: &FunnelHashMap<u64, u64>,
+) {
     let mut group = c.benchmark_group(name);
     group.throughput(Throughput::Elements(query_keys.len() as u64));
-
-    bench_all_impls!(
-        group,
-        BatchSize::LargeInput,
-        || build_std_map(pairs),
-        || build_hashbrown_map(pairs),
-        || build_elastic_map(pairs),
-        || build_funnel_map(pairs),
-        |map| {
+    group.bench_function("std", |b| {
+        b.iter(|| {
             for key in query_keys {
-                black_box(map.get(black_box(key)));
+                black_box(std_map.get(black_box(key)));
             }
-        },
-    );
-
+        });
+    });
+    group.bench_function("hashbrown", |b| {
+        b.iter(|| {
+            for key in query_keys {
+                black_box(hb_map.get(black_box(key)));
+            }
+        });
+    });
+    group.bench_function("elastic", |b| {
+        b.iter(|| {
+            for key in query_keys {
+                black_box(el_map.get(black_box(key)));
+            }
+        });
+    });
+    group.bench_function("funnel", |b| {
+        b.iter(|| {
+            for key in query_keys {
+                black_box(fn_map.get(black_box(key)));
+            }
+        });
+    });
     group.finish();
 }
 
-fn bench_get_hit_throughput(c: &mut Criterion) {
-    let pairs = make_pairs(LOOKUP_MAP_SIZE);
-    let query_keys: Vec<u64> = (0..HIT_LOOKUP_COUNT)
-        .map(|idx| pairs[idx % LOOKUP_MAP_SIZE].0)
-        .collect();
-    bench_lookup_workload(c, "get_hit_throughput", &pairs, &query_keys);
-}
+fn bench_lookups(c: &mut Criterion) {
+    let pairs = make_pairs(MAP_SIZE);
+    let std_map = build_std_map(&pairs);
+    let hb_map = build_hashbrown_map(&pairs);
+    let el_map = build_elastic_map(&pairs);
+    let fn_map = build_funnel_map(&pairs);
 
-fn bench_get_miss_throughput(c: &mut Criterion) {
-    let pairs = make_pairs(LOOKUP_MAP_SIZE);
-    let query_keys: Vec<u64> = (0..MISS_LOOKUP_COUNT)
-        .map(|idx| key_at(idx + LOOKUP_MAP_SIZE + 10_000_000))
+    let hit_keys: Vec<u64> = (0..OP_COUNT).map(|idx| pairs[idx % MAP_SIZE].0).collect();
+    let miss_keys: Vec<u64> = (0..OP_COUNT)
+        .map(|idx| key_at(idx + MAP_SIZE + 10_000_000))
         .collect();
-    bench_lookup_workload(c, "get_miss_throughput", &pairs, &query_keys);
+
+    bench_one_lookup_group(
+        c,
+        "get_hit_throughput",
+        &hit_keys,
+        &std_map,
+        &hb_map,
+        &el_map,
+        &fn_map,
+    );
+    bench_one_lookup_group(
+        c,
+        "get_miss_throughput",
+        &miss_keys,
+        &std_map,
+        &hb_map,
+        &el_map,
+        &fn_map,
+    );
 }
 
 fn bench_tiny_lookup_throughput(c: &mut Criterion) {
     let pairs = make_pairs(TINY_MAP_SIZE);
-    let query_keys: Vec<u64> = (0..TINY_LOOKUP_COUNT)
+    let query_keys: Vec<u64> = (0..TINY_OP_COUNT)
         .map(|idx| {
             if idx % 2 == 0 {
                 pairs[idx % TINY_MAP_SIZE].0
@@ -155,12 +180,24 @@ fn bench_tiny_lookup_throughput(c: &mut Criterion) {
             }
         })
         .collect();
-    bench_lookup_workload(c, "tiny_lookup_throughput", &pairs, &query_keys);
+    let std_map = build_std_map(&pairs);
+    let hb_map = build_hashbrown_map(&pairs);
+    let el_map = build_elastic_map(&pairs);
+    let fn_map = build_funnel_map(&pairs);
+    bench_one_lookup_group(
+        c,
+        "tiny_lookup_throughput",
+        &query_keys,
+        &std_map,
+        &hb_map,
+        &el_map,
+        &fn_map,
+    );
 }
 
 fn bench_delete_heavy_throughput(c: &mut Criterion) {
-    let initial_pairs = make_pairs(DELETE_MAP_SIZE);
-    let replacement_pairs: Vec<(u64, u64)> = (0..DELETE_OP_COUNT)
+    let initial_pairs = make_pairs(MAP_SIZE);
+    let replacement_pairs: Vec<(u64, u64)> = (0..OP_COUNT)
         .map(|idx| {
             let key = key_at(idx + 20_000_000);
             (key, key ^ VALUE_XOR_MIX_ALT)
@@ -168,7 +205,7 @@ fn bench_delete_heavy_throughput(c: &mut Criterion) {
         .collect();
 
     let mut group = c.benchmark_group("delete_heavy_throughput");
-    group.throughput(Throughput::Elements((DELETE_OP_COUNT * 2) as u64));
+    group.throughput(Throughput::Elements((OP_COUNT * 2) as u64));
 
     bench_all_impls!(
         group,
@@ -178,7 +215,7 @@ fn bench_delete_heavy_throughput(c: &mut Criterion) {
         || build_elastic_map(&initial_pairs),
         || build_funnel_map(&initial_pairs),
         |map| {
-            for idx in 0..DELETE_OP_COUNT {
+            for idx in 0..OP_COUNT {
                 black_box(map.remove(black_box(&initial_pairs[idx].0)));
                 let (key, value) = replacement_pairs[idx];
                 black_box(map.insert(black_box(key), black_box(value)));
@@ -190,16 +227,16 @@ fn bench_delete_heavy_throughput(c: &mut Criterion) {
 }
 
 fn bench_mixed_throughput(c: &mut Criterion) {
-    let pairs = make_pairs(MIXED_MAP_SIZE);
-    let ops: Vec<(usize, bool)> = (0..MIXED_OP_COUNT)
+    let pairs = make_pairs(MAP_SIZE);
+    let ops: Vec<(usize, bool)> = (0..OP_COUNT)
         .map(|i| {
-            let idx = ((i as u32).wrapping_mul(2_654_435_761) as usize) % MIXED_MAP_SIZE;
+            let idx = ((i as u32).wrapping_mul(2_654_435_761) as usize) % MAP_SIZE;
             (idx, i & 1 == 0)
         })
         .collect();
 
     let mut group = c.benchmark_group("mixed_throughput");
-    group.throughput(Throughput::Elements(MIXED_OP_COUNT as u64));
+    group.throughput(Throughput::Elements(OP_COUNT as u64));
 
     bench_all_impls!(
         group,
@@ -285,8 +322,7 @@ criterion_group!(
         .measurement_time(Duration::from_secs(2));
     targets =
         bench_insert_throughput,
-        bench_get_hit_throughput,
-        bench_get_miss_throughput,
+        bench_lookups,
         bench_tiny_lookup_throughput,
         bench_mixed_throughput,
         bench_delete_heavy_throughput,

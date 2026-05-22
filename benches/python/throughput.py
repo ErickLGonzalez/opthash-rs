@@ -14,7 +14,7 @@ import pytest
 import opthash
 
 
-N = 10_000
+N = 20_000
 TINY_N = 32
 TINY_QUERIES = 20_000
 RESIZE_N = 8_000
