@@ -28,8 +28,8 @@ IAI_DIR = ROOT / "target" / "iai" / "opthash" / "instr_count"
 
 # Bench groups in `benches/instr_count.rs`. Order = display order.
 OP_GROUPS = (
-    ("get_hit", "Get Hit"),
     ("insert", "Insert"),
+    ("get_hit", "Get Hit"),
     ("remove", "Remove"),
     ("iter", "Iter"),
     ("drain", "Drain"),
