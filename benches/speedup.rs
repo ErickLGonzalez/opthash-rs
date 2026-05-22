@@ -53,7 +53,7 @@ const INSERT_COUNT: usize = 10_000;
 /// Pre-populated map size for the lookup throughput suite.
 const LOOKUP_MAP_SIZE: usize = 20_000;
 /// `get_hit_throughput` lookups per iteration.
-const HIT_LOOKUP_COUNT: usize = 200_000;
+const HIT_LOOKUP_COUNT: usize = 100_000;
 /// `get_miss_throughput` lookups per iteration.
 const MISS_LOOKUP_COUNT: usize = 20_000;
 /// Map size for `tiny_lookup_throughput` — fits comfortably in L1.
@@ -69,7 +69,7 @@ const RESIZE_INSERT_COUNT: usize = 8_000;
 /// Pre-populated map size for `mixed_throughput`.
 const MIXED_MAP_SIZE: usize = 20_000;
 /// Mixed-op (insert/get/delete) count per iteration of `mixed_throughput`.
-const MIXED_OP_COUNT: usize = 200_000;
+const MIXED_OP_COUNT: usize = 100_000;
 
 /// Emits per-impl `bench_function` blocks
 macro_rules! bench_all_impls {
