@@ -220,6 +220,25 @@ impl<K, V, A: Allocator + Clone> SpecialPrimary<K, V, A> {
             group_summaries,
         })
     }
+
+    /// Start group for the probe sequence.
+    #[inline]
+    fn group_start(&self, key_hash: u64) -> usize {
+        probe::hash_to_usize(key_hash.rotate_left(11)) & self.group_count_mask
+    }
+
+    /// Per-key odd step over the pow2 `group_count`. The `| 1` forces odd ⇒
+    /// coprime to pow2 ⇒ `(group_idx + step) & mask` visits every group
+    /// within `group_count` iterations.
+    #[inline]
+    fn group_step(&self, key_hash: u64) -> usize {
+        (probe::hash_to_usize(key_hash.rotate_left(43)) | 1) & self.group_count_mask
+    }
+
+    #[inline]
+    fn first_free_in_group(&self, group_idx: usize) -> Option<usize> {
+        self.table.first_free_in_group(group_idx)
+    }
 }
 
 impl<K, V, A: Allocator> Drop for SpecialPrimary<K, V, A> {
@@ -294,16 +313,21 @@ impl<K, V, A: Allocator> SpecialFallback<K, V, A> {
     }
 
     #[inline]
-    fn bucket_count(&self) -> usize {
-        self.bucket_count
-    }
-
-    #[inline]
     fn bucket_range(&self, bucket_idx: usize) -> Range<usize> {
         let start = bucket_idx << self.bucket_size_log2;
         let size = 1 << self.bucket_size_log2;
         let end = (start + size).min(self.table.capacity());
         start..end
+    }
+
+    #[inline]
+    fn bucket_a(&self, key_hash: u64) -> usize {
+        probe::hash_to_usize(key_hash.rotate_left(19)) % self.bucket_count
+    }
+
+    #[inline]
+    fn bucket_b(&self, key_hash: u64) -> usize {
+        probe::hash_to_usize(key_hash.rotate_left(37)) % self.bucket_count
     }
 }
 
@@ -1407,33 +1431,6 @@ where
         self.hash_builder.hash_one(key)
     }
 
-    /// Start group for the special primary probe sequence. `group_count`
-    /// is pow2 by `SpecialPrimary::with_capacity` construction.
-    #[inline]
-    fn special_primary_group_start(&self, key_hash: u64) -> usize {
-        let mask = self.special.primary.group_count_mask;
-        probe::hash_to_usize(key_hash.rotate_left(11)) & mask
-    }
-
-    /// Per-key odd step over the pow2 `group_count`. The `| 1` forces odd ⇒
-    /// coprime to pow2 ⇒ `(group_idx + step) & mask` visits every group
-    /// within `group_count` iterations.
-    #[inline]
-    fn special_primary_step(&self, key_hash: u64) -> usize {
-        let mask = self.special.primary.group_count_mask;
-        (probe::hash_to_usize(key_hash.rotate_left(43)) | 1) & mask
-    }
-
-    #[inline]
-    fn special_fallback_bucket_a(key_hash: u64, bucket_count: usize) -> usize {
-        probe::hash_to_usize(key_hash.rotate_left(19)) % bucket_count
-    }
-
-    #[inline]
-    fn special_fallback_bucket_b(key_hash: u64, bucket_count: usize) -> usize {
-        probe::hash_to_usize(key_hash.rotate_left(37)) % bucket_count
-    }
-
     #[inline]
     fn choose_slot_for_new_key(&self, key_hash: u64) -> Option<SlotLocation> {
         for (level_idx, level) in self.levels.iter().enumerate() {
@@ -1634,10 +1631,10 @@ where
         let group_count = primary.table.group_count();
         let group_limit = self.primary_probe_limit.min(group_count.max(1));
         let mask = primary.group_count_mask;
-        let mut group_idx = self.special_primary_group_start(key_hash);
-        let step = self.special_primary_step(key_hash);
+        let mut group_idx = primary.group_start(key_hash);
+        let step = primary.group_step(key_hash);
         for _ in 0..group_limit {
-            if let Some(slot_idx) = Self::first_free_in_special_primary_group(primary, group_idx) {
+            if let Some(slot_idx) = primary.first_free_in_group(group_idx) {
                 return Some(slot_idx);
             }
             group_idx = (group_idx + step) & mask;
@@ -1651,9 +1648,8 @@ where
             return None;
         }
 
-        let bucket_count = fallback.bucket_count();
-        let bucket_a = Self::special_fallback_bucket_a(key_hash, bucket_count);
-        let bucket_b = Self::special_fallback_bucket_b(key_hash, bucket_count);
+        let bucket_a = fallback.bucket_a(key_hash);
+        let bucket_b = fallback.bucket_b(key_hash);
 
         for &bucket_idx in &[bucket_a, bucket_b] {
             let range = fallback.bucket_range(bucket_idx);
@@ -1665,14 +1661,6 @@ where
         }
 
         None
-    }
-
-    #[inline]
-    fn first_free_in_special_primary_group(
-        primary: &SpecialPrimary<K, V, A>,
-        group_idx: usize,
-    ) -> Option<usize> {
-        primary.table.first_free_in_group(group_idx)
     }
 
     #[inline]
@@ -1799,8 +1787,8 @@ where
         let group_count = primary.table.group_count();
         let group_limit = self.primary_probe_limit.min(group_count.max(1));
         let mask = primary.group_count_mask;
-        let mut group_idx = self.special_primary_group_start(key_hash);
-        let step = self.special_primary_step(key_hash);
+        let mut group_idx = primary.group_start(key_hash);
+        let step = primary.group_step(key_hash);
         for _ in 0..group_limit {
             if primary.group_summaries[group_idx] & fingerprint_mask != 0 {
                 for relative_idx in primary.table.group_match_mask(group_idx, key_fingerprint) {
@@ -1857,8 +1845,8 @@ where
         let group_limit = self.primary_probe_limit.min(group_count.max(1));
         let mask = primary.group_count_mask;
         let mut candidate = None;
-        let mut group_idx = self.special_primary_group_start(key_hash);
-        let step = self.special_primary_step(key_hash);
+        let mut group_idx = primary.group_start(key_hash);
+        let step = primary.group_step(key_hash);
         for _ in 0..group_limit {
             // Cache the free-in-group result so candidate-population and
             // StopSearch share one SIMD scan per group.
@@ -1915,9 +1903,8 @@ where
             return None;
         }
 
-        let bucket_count = fallback.bucket_count();
-        let bucket_a = Self::special_fallback_bucket_a(key_hash, bucket_count);
-        let bucket_b = Self::special_fallback_bucket_b(key_hash, bucket_count);
+        let bucket_a = fallback.bucket_a(key_hash);
+        let bucket_b = fallback.bucket_b(key_hash);
 
         for bucket_idx in [bucket_a, bucket_b] {
             let range = fallback.bucket_range(bucket_idx);
@@ -1965,9 +1952,8 @@ where
             return (None, self.first_free_in_special_fallback(key_hash));
         }
 
-        let bucket_count = fallback.bucket_count();
-        let bucket_a = Self::special_fallback_bucket_a(key_hash, bucket_count);
-        let bucket_b = Self::special_fallback_bucket_b(key_hash, bucket_count);
+        let bucket_a = fallback.bucket_a(key_hash);
+        let bucket_b = fallback.bucket_b(key_hash);
         let mut candidate = None;
 
         // Find a free slot in either bucket.
