@@ -49,21 +49,21 @@ impl Profiler for FlamegraphProfiler {
 }
 
 /// Items inserted per iteration of `insert_throughput`.
-const INSERT_COUNT: usize = 10_000;
+const INSERT_COUNT: usize = 100_000;
 /// Pre-populated map size for the lookup throughput suite.
 const LOOKUP_MAP_SIZE: usize = 20_000;
 /// `get_hit_throughput` lookups per iteration.
 const HIT_LOOKUP_COUNT: usize = 100_000;
 /// `get_miss_throughput` lookups per iteration.
-const MISS_LOOKUP_COUNT: usize = 20_000;
+const MISS_LOOKUP_COUNT: usize = 100_000;
 /// Map size for `tiny_lookup_throughput` — fits comfortably in L1.
 const TINY_MAP_SIZE: usize = 32;
 /// `tiny_lookup_throughput` lookups per iteration.
-const TINY_LOOKUP_COUNT: usize = 20_000;
+const TINY_LOOKUP_COUNT: usize = 500_000;
 /// Pre-populated map size for `delete_heavy_throughput`.
 const DELETE_MAP_SIZE: usize = 12_000;
 /// Delete + reinsert ops per iteration of `delete_heavy_throughput`.
-const DELETE_OP_COUNT: usize = 6_000;
+const DELETE_OP_COUNT: usize = 50_000;
 /// Inserts per iteration of `resize_heavy_throughput`; triggers multiple resizes.
 const RESIZE_INSERT_COUNT: usize = 8_000;
 /// Pre-populated map size for `mixed_throughput`.
