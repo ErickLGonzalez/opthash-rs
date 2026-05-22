@@ -1240,34 +1240,32 @@ where
             self.alloc.clone(),
         )?;
 
+        let mut scanner = OccupiedScanner::new();
         for level in &mut self.levels {
-            for idx in 0..level.table.capacity() {
-                if level.table.control_at(idx).is_occupied() {
-                    let entry = unsafe { level.table.take(idx) };
-                    new_map.insert_new_entry_unchecked(entry.key, entry.value);
-                }
+            scanner.reset();
+            while let Some(idx) = scanner.next_in(&level.table) {
+                let entry = unsafe { level.table.take(idx) };
+                new_map.insert_new_entry_unchecked(entry.key, entry.value);
             }
             level.table.clear_all_controls();
             level.len = 0;
             level.tombstones = 0;
         }
 
-        for idx in 0..self.special.primary.table.capacity() {
-            if self.special.primary.table.control_at(idx).is_occupied() {
-                let entry = unsafe { self.special.primary.table.take(idx) };
-                new_map.insert_new_entry_unchecked(entry.key, entry.value);
-            }
+        scanner.reset();
+        while let Some(idx) = scanner.next_in(&self.special.primary.table) {
+            let entry = unsafe { self.special.primary.table.take(idx) };
+            new_map.insert_new_entry_unchecked(entry.key, entry.value);
         }
         self.special.primary.table.clear_all_controls();
         self.special.primary.len = 0;
         self.special.primary.tombstones = 0;
         self.special.primary.group_summaries.fill(0);
 
-        for idx in 0..self.special.fallback.table.capacity() {
-            if self.special.fallback.table.control_at(idx).is_occupied() {
-                let entry = unsafe { self.special.fallback.table.take(idx) };
-                new_map.insert_new_entry_unchecked(entry.key, entry.value);
-            }
+        scanner.reset();
+        while let Some(idx) = scanner.next_in(&self.special.fallback.table) {
+            let entry = unsafe { self.special.fallback.table.take(idx) };
+            new_map.insert_new_entry_unchecked(entry.key, entry.value);
         }
         self.special.fallback.table.clear_all_controls();
         self.special.fallback.len = 0;
@@ -1346,41 +1344,6 @@ where
     /// special in-place at `new_capacity`, reinsert. Also serves as a
     /// no-grow rehash when called with the current capacity.
     fn resize(&mut self, new_capacity: usize) {
-        let mut entries = Vec::with_capacity(self.len);
-
-        for level in &mut self.levels {
-            for idx in 0..level.table.capacity() {
-                if level.table.control_at(idx).is_occupied() {
-                    let entry = unsafe { level.table.take(idx) };
-                    entries.push((entry.key, entry.value));
-                }
-            }
-            level.table.clear_all_controls();
-            level.len = 0;
-            level.tombstones = 0;
-        }
-
-        for idx in 0..self.special.primary.table.capacity() {
-            if self.special.primary.table.control_at(idx).is_occupied() {
-                let entry = unsafe { self.special.primary.table.take(idx) };
-                entries.push((entry.key, entry.value));
-            }
-        }
-        self.special.primary.table.clear_all_controls();
-        self.special.primary.len = 0;
-        self.special.primary.tombstones = 0;
-        self.special.primary.group_summaries.fill(0);
-
-        for idx in 0..self.special.fallback.table.capacity() {
-            if self.special.fallback.table.control_at(idx).is_occupied() {
-                let entry = unsafe { self.special.fallback.table.take(idx) };
-                entries.push((entry.key, entry.value));
-            }
-        }
-        self.special.fallback.table.clear_all_controls();
-        self.special.fallback.len = 0;
-        self.special.fallback.tombstones = 0;
-
         let level_count = compute_level_count(self.reserve_fraction);
         let bucket_width = align::round_up_to_group(compute_bucket_width(self.reserve_fraction));
         let mut special_capacity =
@@ -1411,16 +1374,40 @@ where
             self.alloc.clone(),
         );
 
-        self.levels = new_levels;
-        self.special = new_special;
+        // Swap new storage in; old move local for draining.
+        let old_levels = std::mem::replace(&mut self.levels, new_levels);
+        let old_special = std::mem::replace(&mut self.special, new_special);
         self.capacity = new_capacity;
         self.max_insertions = capacity::max_insertions(new_capacity, self.reserve_fraction);
         self.max_populated_level = 0;
         self.len = 0;
 
-        for (key, value) in entries {
-            self.insert_new_entry_unchecked(key, value);
+        // `take` leaves ctrl stale; clear so Drop doesn't double-drop.
+        let mut scanner = OccupiedScanner::new();
+        for mut level in old_levels {
+            scanner.reset();
+            while let Some(idx) = scanner.next_in(&level.table) {
+                let entry = unsafe { level.table.take(idx) };
+                self.insert_new_entry_unchecked(entry.key, entry.value);
+            }
+            level.table.clear_all_controls();
         }
+        let SpecialArray {
+            mut primary,
+            mut fallback,
+        } = old_special;
+        scanner.reset();
+        while let Some(idx) = scanner.next_in(&primary.table) {
+            let entry = unsafe { primary.table.take(idx) };
+            self.insert_new_entry_unchecked(entry.key, entry.value);
+        }
+        primary.table.clear_all_controls();
+        scanner.reset();
+        while let Some(idx) = scanner.next_in(&fallback.table) {
+            let entry = unsafe { fallback.table.take(idx) };
+            self.insert_new_entry_unchecked(entry.key, entry.value);
+        }
+        fallback.table.clear_all_controls();
     }
 
     #[inline]

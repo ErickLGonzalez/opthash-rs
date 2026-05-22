@@ -1483,19 +1483,6 @@ where
     /// `new_capacity` in-place, reinsert. Passing the current capacity
     /// performs a no-grow rehash that flushes accumulated tombstones.
     fn resize(&mut self, new_capacity: usize) {
-        let mut entries = Vec::with_capacity(self.len);
-        for level in &mut self.levels {
-            for idx in 0..level.table.capacity() {
-                if level.table.control_at(idx).is_occupied() {
-                    let entry = unsafe { level.table.take(idx) };
-                    entries.push((entry.key, entry.value));
-                }
-            }
-            level.table.clear_all_controls();
-            level.len = 0;
-            level.tombstones = 0;
-        }
-
         let level_capacities = partition_levels(new_capacity);
         let new_levels: Vec<Level<K, V, A>> = level_capacities
             .iter()
@@ -1515,7 +1502,8 @@ where
             build_batch_plan(&level_capacities, self.reserve_fraction, new_max_insertions);
         let new_batch_remaining = new_batch_plan.first().copied().unwrap_or(0);
 
-        self.levels = new_levels;
+        // Swap new levels in; old move local for draining.
+        let old_levels = std::mem::replace(&mut self.levels, new_levels);
         self.capacity = new_capacity;
         self.max_insertions = new_max_insertions;
         self.batch_plan = new_batch_plan;
@@ -1524,8 +1512,15 @@ where
         self.max_populated_level = 0;
         self.len = 0;
 
-        for (key, value) in entries {
-            self.insert(key, value);
+        // `take` leaves ctrl stale; clear so Drop doesn't double-drop.
+        let mut scanner = OccupiedScanner::new();
+        for mut level in old_levels {
+            scanner.reset();
+            while let Some(idx) = scanner.next_in(&level.table) {
+                let entry = unsafe { level.table.take(idx) };
+                self.insert(entry.key, entry.value);
+            }
+            level.table.clear_all_controls();
         }
     }
 
@@ -1546,12 +1541,12 @@ where
             self.alloc.clone(),
         )?;
 
+        let mut scanner = OccupiedScanner::new();
         for level in &mut self.levels {
-            for idx in 0..level.table.capacity() {
-                if level.table.control_at(idx).is_occupied() {
-                    let entry = unsafe { level.table.take(idx) };
-                    new_map.insert(entry.key, entry.value);
-                }
+            scanner.reset();
+            while let Some(idx) = scanner.next_in(&level.table) {
+                let entry = unsafe { level.table.take(idx) };
+                new_map.insert(entry.key, entry.value);
             }
             level.table.clear_all_controls();
             level.len = 0;
