@@ -74,10 +74,9 @@ impl FunnelOptions {
     }
 }
 
-/// One level in the funnel array. Each level is a fixed grid of buckets;
-/// inserts hash a key to one bucket and probe within that bucket only.
-/// If the bucket is full the insert spills to the next level (or the
-/// special array). Bucket-local probing keeps lookup cost bounded.
+/// One funnel level `A_i` (paper §5). Fixed grid of `β`-sized buckets `A_{i,j}`;
+/// inserts hash to one bucket and probe within it. Overflow spills to `A_{i+1}`
+/// (or the special array `A_{α+1}`).
 struct BucketLevel<K, V, A: Allocator = Global> {
     /// Structure of Arrays control bytes + entries.
     table: RawTable<SlotEntry<K, V>, A>,
@@ -157,6 +156,126 @@ impl<K, V, A: Allocator> BucketLevel<K, V, A> {
         let size = 1 << self.bucket_size_log2;
         start..start + size
     }
+
+    /// Paper §5 attempted insertion: hash `key_hash` to one bucket `A_{i,j}`,
+    /// return the first empty slot in that bucket (or `None` if full).
+    fn first_free_in_bucket(&self, key_hash: u64) -> Option<usize> {
+        if self.len >= self.capacity() {
+            return None;
+        }
+
+        let bucket_idx = self.bucket_index(key_hash);
+        let bucket_range = self.bucket_range(bucket_idx);
+        // SAFETY: `bucket_size` is `GROUP_SIZE`-aligned at construction.
+        // Hinting elides the `& ~0xF` LLVM emits to fold `(start / 16) * 16`.
+        debug_assert_eq!(bucket_range.start % GROUP_SIZE, 0);
+        if !bucket_range.start.is_multiple_of(GROUP_SIZE) {
+            unsafe { std::hint::unreachable_unchecked() };
+        }
+        let group_idx = bucket_range.start / GROUP_SIZE;
+        self.table
+            .group_free_mask(group_idx)
+            .lowest()
+            .map(|offset| bucket_range.start + offset)
+    }
+
+    /// Probe one bucket for `key`. SIMD fingerprint scan + key compare.
+    /// `StopSearch` on EMPTY byte: bucket never overflowed,
+    ///  so the key cannot be at a deeper level.
+    #[inline]
+    fn find_in_bucket<Q>(&self, key_hash: u64, key_fingerprint: u8, key: &Q) -> LookupStep
+    where
+        K: Borrow<Q>,
+        Q: Eq + ?Sized,
+    {
+        if self.len == 0 {
+            return LookupStep::Continue;
+        }
+
+        let bucket_idx = self.bucket_index(key_hash);
+        let bucket_range = self.bucket_range(bucket_idx);
+        // SAFETY: `bucket_size` is `GROUP_SIZE`-aligned at construction.
+        // Hinting elides the `& ~0xF` LLVM emits to fold `(start / 16) * 16`.
+        debug_assert_eq!(bucket_range.start % GROUP_SIZE, 0);
+        if !bucket_range.start.is_multiple_of(GROUP_SIZE) {
+            unsafe { std::hint::unreachable_unchecked() };
+        }
+        let group_idx = bucket_range.start / GROUP_SIZE;
+        // SAFETY: `len > 0` ⇒ `capacity > 0`; `bucket_range.start < capacity`.
+        unsafe { self.table.prefetch_slot(bucket_range.start) };
+
+        for relative_idx in self.table.group_match_mask(group_idx, key_fingerprint) {
+            let slot_idx = bucket_range.start + relative_idx;
+            let entry = unsafe { self.table.get_ref(slot_idx) };
+            if entry.key.borrow() == key {
+                return LookupStep::Found(slot_idx);
+            }
+        }
+
+        // StopSearch: bucket has an EMPTY byte → no key ever overflowed past here.
+        // Tombstones in the bucket don't disable termination since the
+        // empty byte still proves the probe chain terminated naturally.
+        if self.table.group_match_mask(group_idx, CTRL_EMPTY).any() {
+            return LookupStep::StopSearch;
+        }
+        LookupStep::Continue
+    }
+
+    /// Like [`Self::find_in_bucket`] but also returns the first free slot in
+    /// the bucket (insert candidate) alongside the lookup outcome.
+    #[inline]
+    fn find_in_bucket_with_candidate<Q>(
+        &self,
+        key_hash: u64,
+        key_fingerprint: u8,
+        key: &Q,
+    ) -> (LookupStep, Option<usize>)
+    where
+        K: Borrow<Q>,
+        Q: Eq + ?Sized,
+    {
+        if self.len == 0 {
+            return (LookupStep::Continue, None);
+        }
+
+        let bucket_idx = self.bucket_index(key_hash);
+        let bucket_range = self.bucket_range(bucket_idx);
+        // SAFETY: `bucket_size` is `GROUP_SIZE`-aligned at construction.
+        // Hinting elides the `& ~0xF` LLVM emits to fold `(start / 16) * 16`.
+        debug_assert_eq!(bucket_range.start % GROUP_SIZE, 0);
+        if !bucket_range.start.is_multiple_of(GROUP_SIZE) {
+            unsafe { std::hint::unreachable_unchecked() };
+        }
+        let group_idx = bucket_range.start / GROUP_SIZE;
+        // SAFETY: `len > 0` ⇒ `capacity > 0`; `bucket_range.start < capacity`.
+        unsafe { self.table.prefetch_slot(bucket_range.start) };
+
+        for relative_idx in self.table.group_match_mask(group_idx, key_fingerprint) {
+            let slot_idx = bucket_range.start + relative_idx;
+            let entry = unsafe { self.table.get_ref(slot_idx) };
+            if entry.key.borrow() == key {
+                let free_candidate = self
+                    .table
+                    .group_free_mask(group_idx)
+                    .lowest()
+                    .map(|o| bucket_range.start + o);
+                return (LookupStep::Found(slot_idx), free_candidate);
+            }
+        }
+
+        let free_candidate = self
+            .table
+            .group_free_mask(group_idx)
+            .lowest()
+            .map(|o| bucket_range.start + o);
+
+        let step = if self.table.group_match_mask(group_idx, CTRL_EMPTY).any() {
+            LookupStep::StopSearch
+        } else {
+            LookupStep::Continue
+        };
+        (step, free_candidate)
+    }
 }
 
 impl<K, V, A: Allocator> Drop for BucketLevel<K, V, A> {
@@ -169,8 +288,9 @@ impl<K, V, A: Allocator> Drop for BucketLevel<K, V, A> {
     }
 }
 
-/// Fallback table for keys that didn't fit in any bucket level. SIMD-group
-/// open addressing with per-key odd-step probing over pow2 `group_count`
+/// Half `B` of the special array `A_{α+1}` (paper §5):
+/// uniform-probing table capped at `primary_probe_limit` ≈ log log n probes.
+/// SIMD-group open addressing with per-key odd-step probing over pow2 `group_count`
 /// (step coprime to `group_count` ⇒ permutation over all groups).
 struct SpecialPrimary<K, V, A: Allocator = Global> {
     /// `SoA` control bytes + entries.
@@ -251,9 +371,9 @@ impl<K, V, A: Allocator> Drop for SpecialPrimary<K, V, A> {
     }
 }
 
-/// Last-resort table for keys that exhaust the special primary's probe budget.
-/// Bucketed like `BucketLevel` but with larger buckets (`2 * primary_probe_limit`)
-/// so a key that's been pushed this far almost certainly fits.
+/// Half `C` of the special array `A_{α+1}` (paper §5):
+/// two-choice table with buckets of size `2 * primary_probe_limit` ≈ 2 log log n.
+/// Reached only when a key exhausts the primary's probe budget.
 struct SpecialFallback<K, V, A: Allocator = Global> {
     /// Structure of Arrays control bytes + entries.
     table: RawTable<SlotEntry<K, V>, A>,
@@ -349,6 +469,9 @@ struct SpecialArray<K, V, A: Allocator + Clone = Global> {
     primary: SpecialPrimary<K, V, A>,
     /// Probed after primary hits its limit.
     fallback: SpecialFallback<K, V, A>,
+    /// `primary.len + fallback.len`. Cached so the lookup fast path can
+    /// short-circuit on a single load when the special tables are empty.
+    total_len: usize,
 }
 
 impl<K, V, A: Allocator + Clone> SpecialArray<K, V, A> {
@@ -363,6 +486,7 @@ impl<K, V, A: Allocator + Clone> SpecialArray<K, V, A> {
                 fallback_bucket_size,
                 alloc,
             ),
+            total_len: 0,
         }
     }
 
@@ -382,6 +506,7 @@ impl<K, V, A: Allocator + Clone> SpecialArray<K, V, A> {
                 fallback_bucket_size,
                 alloc,
             )?,
+            total_len: 0,
         })
     }
 }
@@ -555,6 +680,7 @@ where
     /// across grows.
     #[must_use]
     pub fn with_options_and_hasher_in(options: FunnelOptions, hash_builder: S, alloc: A) -> Self {
+        // Paper §5 precondition: δ ≤ 1/8.
         let reserve_fraction = capacity::sanitize_reserve_fraction(options.reserve_fraction)
             .min(MAX_FUNNEL_RESERVE_FRACTION);
         let capacity = options.capacity;
@@ -723,8 +849,7 @@ where
             };
 
         if let Some(location) = level_candidate
-            && self.special.primary.len == 0
-            && self.special.fallback.len == 0
+            && self.special.total_len == 0
         {
             return self.insert_at_location_after_resize_check(
                 Some(location),
@@ -981,6 +1106,7 @@ where
                     primary.tombstones += 1;
                 }
                 primary.len -= 1;
+                self.special.total_len -= 1;
                 let needs_resize = primary.tombstones > primary.table.capacity() / 2;
                 (removed, needs_resize)
             }
@@ -991,6 +1117,7 @@ where
                     fallback.tombstones += 1;
                 }
                 fallback.len -= 1;
+                self.special.total_len -= 1;
                 let needs_resize = fallback.tombstones > fallback.capacity() / 2;
                 (removed, needs_resize)
             }
@@ -1218,6 +1345,7 @@ where
         self.special.fallback.table.clear_all_controls();
         self.special.fallback.len = 0;
         self.special.fallback.tombstones = 0;
+        self.special.total_len = 0;
 
         self.len = 0;
         self.max_populated_level = 0;
@@ -1270,6 +1398,7 @@ where
         self.special.fallback.table.clear_all_controls();
         self.special.fallback.len = 0;
         self.special.fallback.tombstones = 0;
+        self.special.total_len = 0;
 
         self.len = 0;
         self.max_populated_level = 0;
@@ -1395,6 +1524,7 @@ where
         let SpecialArray {
             mut primary,
             mut fallback,
+            total_len: _,
         } = old_special;
         scanner.reset();
         while let Some(idx) = scanner.next_in(&primary.table) {
@@ -1418,10 +1548,13 @@ where
         self.hash_builder.hash_one(key)
     }
 
+    /// Paper §5 insertion chain: attempt `L_1`, `L_2`, …, `L_α` in order,
+    /// stopping on the first level whose hashed bucket has a free slot;
+    /// spill to `A_{α+1}`.
     #[inline]
     fn choose_slot_for_new_key(&self, key_hash: u64) -> Option<SlotLocation> {
         for (level_idx, level) in self.levels.iter().enumerate() {
-            if let Some(slot_idx) = Self::first_free_in_level_bucket(key_hash, level) {
+            if let Some(slot_idx) = level.first_free_in_bucket(key_hash) {
                 return Some(SlotLocation::Level {
                     level_idx,
                     slot_idx,
@@ -1457,7 +1590,7 @@ where
 
         for (level_idx, level) in self.levels[..search_limit].iter().enumerate() {
             let (lookup_step, slot_candidate) =
-                Self::find_in_level_bucket_with_candidate(key_hash, key_fingerprint, key, level);
+                level.find_in_bucket_with_candidate(key_hash, key_fingerprint, key);
             if candidate.is_none() {
                 candidate = slot_candidate.map(|slot_idx| SlotLocation::Level {
                     level_idx,
@@ -1574,6 +1707,7 @@ where
                 if was_tombstone {
                     primary.tombstones -= 1;
                 }
+                self.special.total_len += 1;
             }
             SlotLocation::SpecialFallback { slot_idx } => {
                 let fallback = &mut self.special.fallback;
@@ -1583,30 +1717,10 @@ where
                     key_fingerprint,
                 );
                 fallback.len += 1;
+                self.special.total_len += 1;
             }
         }
         self.len += 1;
-    }
-
-    fn first_free_in_level_bucket(key_hash: u64, level: &BucketLevel<K, V, A>) -> Option<usize> {
-        if level.len >= level.capacity() {
-            return None;
-        }
-
-        let bucket_idx = level.bucket_index(key_hash);
-        let bucket_range = level.bucket_range(bucket_idx);
-        // SAFETY: `bucket_size` is `GROUP_SIZE`-aligned at construction.
-        // Hinting elides the `& ~0xF` LLVM emits to fold `(start / 16) * 16`.
-        debug_assert_eq!(bucket_range.start % GROUP_SIZE, 0);
-        if !bucket_range.start.is_multiple_of(GROUP_SIZE) {
-            unsafe { std::hint::unreachable_unchecked() };
-        }
-        let group_idx = bucket_range.start / GROUP_SIZE;
-        level
-            .table
-            .group_free_mask(group_idx)
-            .lowest()
-            .map(|offset| bucket_range.start + offset)
     }
 
     fn first_free_in_special_primary(&self, key_hash: u64) -> Option<usize> {
@@ -1648,111 +1762,6 @@ where
         }
 
         None
-    }
-
-    #[inline]
-    fn find_in_level_bucket<Q>(
-        key_hash: u64,
-        key_fingerprint: u8,
-        key: &Q,
-        level: &BucketLevel<K, V, A>,
-    ) -> LookupStep
-    where
-        K: Borrow<Q>,
-        Q: Eq + ?Sized,
-    {
-        if level.len == 0 {
-            return LookupStep::Continue;
-        }
-
-        let bucket_idx = level.bucket_index(key_hash);
-        let bucket_range = level.bucket_range(bucket_idx);
-        // SAFETY: `bucket_size` is `GROUP_SIZE`-aligned at construction.
-        // Hinting elides the `& ~0xF` LLVM emits to fold `(start / 16) * 16`.
-        debug_assert_eq!(bucket_range.start % GROUP_SIZE, 0);
-        if !bucket_range.start.is_multiple_of(GROUP_SIZE) {
-            unsafe { std::hint::unreachable_unchecked() };
-        }
-        let group_idx = bucket_range.start / GROUP_SIZE;
-        // SAFETY: `level.len > 0` ⇒ `capacity > 0`; `bucket_range.start
-        // < capacity` by construction.
-        unsafe { level.table.prefetch_slot(bucket_range.start) };
-
-        // SIMD fingerprint scan — same as _with_candidate.
-        for relative_idx in level.table.group_match_mask(group_idx, key_fingerprint) {
-            let slot_idx = bucket_range.start + relative_idx;
-            let entry = unsafe { level.table.get_ref(slot_idx) };
-            if entry.key.borrow() == key {
-                return LookupStep::Found(slot_idx);
-            }
-        }
-
-        // StopSearch: bucket has an EMPTY byte → no key ever overflowed past
-        // here. Tombstones in the bucket don't disable termination since the
-        // empty byte still proves the probe chain terminated naturally.
-        if level.table.group_match_mask(group_idx, CTRL_EMPTY).any() {
-            return LookupStep::StopSearch;
-        }
-
-        LookupStep::Continue
-    }
-
-    #[inline]
-    fn find_in_level_bucket_with_candidate<Q>(
-        key_hash: u64,
-        key_fingerprint: u8,
-        key: &Q,
-        level: &BucketLevel<K, V, A>,
-    ) -> (LookupStep, Option<usize>)
-    where
-        K: Borrow<Q>,
-        Q: Eq + ?Sized,
-    {
-        if level.len == 0 {
-            return (LookupStep::Continue, None);
-        }
-
-        let bucket_idx = level.bucket_index(key_hash);
-        let bucket_range = level.bucket_range(bucket_idx);
-        // SAFETY: `bucket_size` is `GROUP_SIZE`-aligned at construction.
-        // Hinting elides the `& ~0xF` LLVM emits to fold `(start / 16) * 16`.
-        debug_assert_eq!(bucket_range.start % GROUP_SIZE, 0);
-        if !bucket_range.start.is_multiple_of(GROUP_SIZE) {
-            unsafe { std::hint::unreachable_unchecked() };
-        }
-        let group_idx = bucket_range.start / GROUP_SIZE;
-        // SAFETY: `level.len > 0` ⇒ `capacity > 0`; `bucket_range.start
-        // < capacity` by construction.
-        unsafe { level.table.prefetch_slot(bucket_range.start) };
-
-        // SIMD fingerprint scan over the bucket's control bytes.
-        for relative_idx in level.table.group_match_mask(group_idx, key_fingerprint) {
-            let slot_idx = bucket_range.start + relative_idx;
-            let entry = unsafe { level.table.get_ref(slot_idx) };
-            if entry.key.borrow() == key {
-                let free_candidate = level
-                    .table
-                    .group_free_mask(group_idx)
-                    .lowest()
-                    .map(|o| bucket_range.start + o);
-                return (LookupStep::Found(slot_idx), free_candidate);
-            }
-        }
-
-        // No match — compute free candidate and early-exit status.
-        let free_candidate = level
-            .table
-            .group_free_mask(group_idx)
-            .lowest()
-            .map(|o| bucket_range.start + o);
-
-        let step = if level.table.group_match_mask(group_idx, CTRL_EMPTY).any() {
-            LookupStep::StopSearch
-        } else {
-            LookupStep::Continue
-        };
-
-        (step, free_candidate)
     }
 
     /// Probe the special primary for `key` (lookup-only — no insert
@@ -1974,19 +1983,15 @@ where
         K: Borrow<Q>,
         Q: Eq + ?Sized,
     {
-        if let Some(level0) = self.levels.first() {
-            match Self::find_in_level_bucket(key_hash, key_fingerprint, key, level0) {
-                LookupStep::Found(slot_idx) => {
-                    return Some(SlotLocation::Level {
-                        level_idx: 0,
-                        slot_idx,
-                    });
-                }
-                LookupStep::Continue => {}
-                LookupStep::StopSearch => return None,
+        match self.levels[0].find_in_bucket(key_hash, key_fingerprint, key) {
+            LookupStep::Found(slot_idx) => {
+                return Some(SlotLocation::Level {
+                    level_idx: 0,
+                    slot_idx,
+                });
             }
-        } else {
-            return None;
+            LookupStep::Continue => {}
+            LookupStep::StopSearch => return None,
         }
 
         // L1+ is empty in steady state at default load; outline only when populated.
@@ -1998,7 +2003,7 @@ where
         }
 
         // Special tables — only populated under overflow.
-        if self.special.primary.len == 0 && self.special.fallback.len == 0 {
+        if self.special.total_len == 0 {
             return None;
         }
 
@@ -2019,7 +2024,7 @@ where
     {
         let search_limit = (self.max_populated_level + 1).min(self.levels.len());
         for (offset, level) in self.levels[1..search_limit].iter().enumerate() {
-            match Self::find_in_level_bucket(key_hash, key_fingerprint, key, level) {
+            match level.find_in_bucket(key_hash, key_fingerprint, key) {
                 LookupStep::Found(slot_idx) => {
                     return ControlFlow::Break(Some(SlotLocation::Level {
                         level_idx: offset + 1,
@@ -2180,22 +2185,26 @@ where
                 (removed, needs_resize)
             }
             SlotLocation::SpecialPrimary { slot_idx } => {
-                let primary = &mut self.map.special.primary;
+                let special = &mut self.map.special;
+                let primary = &mut special.primary;
                 let removed = unsafe { primary.table.take(slot_idx) };
                 if primary.table.erase(slot_idx) {
                     primary.tombstones += 1;
                 }
                 primary.len -= 1;
+                special.total_len -= 1;
                 let needs_resize = primary.tombstones > primary.table.capacity() / 2;
                 (removed, needs_resize)
             }
             SlotLocation::SpecialFallback { slot_idx } => {
-                let fallback = &mut self.map.special.fallback;
+                let special = &mut self.map.special;
+                let fallback = &mut special.fallback;
                 let removed = unsafe { fallback.table.take(slot_idx) };
                 if fallback.table.erase(slot_idx) {
                     fallback.tombstones += 1;
                 }
                 fallback.len -= 1;
+                special.total_len -= 1;
                 let needs_resize = fallback.tombstones > fallback.capacity() / 2;
                 (removed, needs_resize)
             }
@@ -2537,6 +2546,7 @@ impl<K, V, S, A: Allocator + Clone> Drop for Drain<'_, K, V, S, A> {
         self.map.special.fallback.table.clear_all_controls();
         self.map.special.fallback.len = 0;
         self.map.special.fallback.tombstones = 0;
+        self.map.special.total_len = 0;
         self.map.len = 0;
         self.map.max_populated_level = 0;
     }
@@ -2612,6 +2622,7 @@ where
                                 primary.tombstones += 1;
                             }
                             primary.len -= 1;
+                            self.map.special.total_len -= 1;
                             self.map.len -= 1;
                             return Some((removed.key, removed.value));
                         }
@@ -2629,6 +2640,7 @@ where
                                 fallback.tombstones += 1;
                             }
                             fallback.len -= 1;
+                            self.map.special.total_len -= 1;
                             self.map.len -= 1;
                             return Some((removed.key, removed.value));
                         }
@@ -2926,21 +2938,18 @@ unsafe fn funnel_slot_value_ptr<K, V, A: Allocator + Clone>(
     unsafe { &raw mut (*entry_ptr).value }
 }
 
-/// Number of bucket levels for a given reserve fraction. Tighter reserve →
-/// more levels (more probing budget per insert).
+/// Paper §5: `α = ⌈4 log δ⁻¹ + 10⌉` levels (excluding the special array).
 fn compute_level_count(reserve_fraction: f64) -> usize {
     cast::ceil_to_usize((4.0 * (1.0 / reserve_fraction).log2() + 10.0).max(1.0))
 }
 
-/// Per-bucket slot count. Wider buckets reduce overflow into deeper levels
-/// at the cost of more in-bucket probing.
+/// Paper §5: `β = ⌈2 log δ⁻¹⌉` slots per bucket A_{i,j}.
 fn compute_bucket_width(reserve_fraction: f64) -> usize {
     cast::ceil_to_usize((2.0 * (1.0 / reserve_fraction).log2()).max(1.0))
 }
 
-/// Carve out the special-array capacity from the total. Returns
-/// `(level_capacity, special_capacity)` such that levels get the bulk and
-/// special gets a fraction sized to absorb expected overflow.
+/// Paper §5: `⌈δn/2⌉ ≤ |A_{α+1}| ≤ ⌊3δn/4⌋`, with the main capacity
+/// constrained to a multiple of `β` so each level is `β·a_i` slots.
 fn choose_special_capacity(
     total_capacity: usize,
     reserve_fraction: f64,
@@ -2983,6 +2992,8 @@ fn choose_special_capacity(
     best_special_capacity
 }
 
+/// Paper §5: split `α` levels with `a_{i+1} = 3a_i/4 ± 1`, geometrically decreasing.
+/// Output is monotone non-increasing so `L0` is always the largest.
 fn partition_funnel_buckets(total_buckets: usize, level_count: usize) -> Vec<usize> {
     if level_count == 0 {
         return Vec::new();
@@ -3084,7 +3095,7 @@ fn build_funnel_bucket_sequence(
 fn next_bucket_count_bounds(current_bucket_count: usize) -> (usize, usize) {
     let scaled = current_bucket_count.saturating_mul(3);
     let min_next_bucket_count = scaled.saturating_sub(4).div_ceil(4);
-    let max_next_bucket_count = scaled.saturating_add(4) / 4;
+    let max_next_bucket_count = (scaled.saturating_add(4) / 4).min(current_bucket_count);
     (
         min_next_bucket_count,
         max_next_bucket_count.max(min_next_bucket_count),
@@ -3132,6 +3143,27 @@ mod tests {
             total <= capacity * 2,
             "total={total} exceeds 2x of requested={capacity}",
         );
+    }
+
+    #[test]
+    fn partition_buckets_monotone_paper_invariant() {
+        // Paper: A_i are "geometrically decreasing in size" (a_{i+1} = 3a_i/4 ± 1).
+        // Concretely, partition output must be monotone non-increasing so that
+        // L0 is always largest (highest hit rate, shortest insert chain).
+        for total in 0usize..=64 {
+            for levels in 1usize..=24 {
+                let p = partition_funnel_buckets(total, levels);
+                assert_eq!(p.len(), levels, "len mismatch for ({total}, {levels})");
+                assert_eq!(
+                    p.iter().sum::<usize>(),
+                    total,
+                    "sum for ({total}, {levels})"
+                );
+                for w in p.windows(2) {
+                    assert!(w[1] <= w[0], "non-monotone for ({total}, {levels}): {p:?}");
+                }
+            }
+        }
     }
 
     #[test]

@@ -74,8 +74,8 @@ impl ElasticOptions {
     }
 }
 
-/// One level in elastic hashing's geometric partition: an independent
-/// open-addressed table roughly half the previous level's capacity.
+/// One sub-array `A_i` in paper §4's partition `|A_{i+1}| = |A_i|/2 ± 1`.
+/// Independent open-addressed table with its own probe sequence `h_{i,j}(x)`.
 struct Level<K, V, A: Allocator + Clone = Global> {
     /// `SoA` control bytes + entries.
     table: RawTable<SlotEntry<K, V>, A>,
@@ -180,6 +180,54 @@ impl<K, V, A: Allocator + Clone> Level<K, V, A> {
     #[inline]
     fn needs_cleanup(&self) -> bool {
         self.tombstones > self.capacity() / 2
+    }
+
+    /// Triangular-probing starting group: `(key_hash ^ salt) & (group_count - 1)`.
+    /// `group_count` is pow2 by `partition_levels` construction.
+    #[inline]
+    fn triangular_group_start(&self, key_hash: u64) -> usize {
+        let mixed = key_hash ^ self.salt;
+        probe::hash_to_usize(mixed) & self.group_count_mask
+    }
+
+    /// Paper §4 search in this `A_i`: triangular probe of groups, SIMD
+    /// fingerprint match, key compare. Stops on FREE byte (probe chain
+    /// terminated naturally; key cannot be deeper in this level).
+    #[inline]
+    fn find_by_probe<Q>(&self, key_hash: u64, key_fingerprint: u8, key: &Q) -> Option<usize>
+    where
+        K: Borrow<Q>,
+        Q: Eq + ?Sized,
+    {
+        if self.len == 0 {
+            return None;
+        }
+
+        let group_count = self.table.group_count();
+        let mask = self.group_count_mask;
+        let mut group_idx = self.triangular_group_start(key_hash);
+        let mut delta: usize = 0;
+
+        for _ in 0..group_count {
+            // Warm slot data while SIMD scan runs.
+            // SAFETY: `self.len > 0` ⇒ `capacity > 0`; `group_idx <
+            // group_count` ⇒ `group_idx * GROUP_SIZE < capacity`.
+            unsafe { self.table.prefetch_slot(group_idx * GROUP_SIZE) };
+            let match_mask = self.table.group_match_mask(group_idx, key_fingerprint);
+            for relative_idx in match_mask {
+                let slot_idx = group_idx * GROUP_SIZE + relative_idx;
+                let entry = unsafe { self.table.get_ref(slot_idx) };
+                if entry.key.borrow() == key {
+                    return Some(slot_idx);
+                }
+            }
+            if self.table.group_match_mask(group_idx, CTRL_EMPTY).any() {
+                return None;
+            }
+            delta += 1;
+            group_idx = (group_idx + delta) & mask;
+        }
+        None
     }
 }
 
@@ -1479,6 +1527,38 @@ where
     S: BuildHasher,
     A: Allocator + Clone,
 {
+    /// Insert `(key, value)` known to be new. Skips the existence check and
+    /// capacity check in `insert`; resize loops drain old levels into fresh
+    /// (all-EMPTY) ones, so neither check can succeed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `choose_slot_for_new_key` finds no slot — caller is
+    /// responsible for sizing the new levels to fit every drained entry.
+    #[inline]
+    fn insert_unique(&mut self, key: K, value: V) {
+        let key_hash = self.hash_key(&key);
+        let key_fingerprint = control::control_fingerprint(key_hash);
+
+        self.advance_batch_window();
+        let (level_idx, slot_idx) = self
+            .choose_slot_for_new_key(key_hash)
+            .expect("no free slot found in freshly-allocated map");
+
+        let level = &mut self.levels[level_idx];
+        level
+            .table
+            .write_with_control(slot_idx, SlotEntry { key, value }, key_fingerprint);
+        level.len += 1;
+        if level_idx > self.max_populated_level {
+            self.max_populated_level = level_idx;
+        }
+        self.len += 1;
+        if self.batch_remaining > 0 {
+            self.batch_remaining -= 1;
+        }
+    }
+
     /// Drain all live entries into a temp Vec, rebuild levels at
     /// `new_capacity` in-place, reinsert. Passing the current capacity
     /// performs a no-grow rehash that flushes accumulated tombstones.
@@ -1518,7 +1598,7 @@ where
             scanner.reset();
             while let Some(idx) = scanner.next_in(&level.table) {
                 let entry = unsafe { level.table.take(idx) };
-                self.insert(entry.key, entry.value);
+                self.insert_unique(entry.key, entry.value);
             }
             level.table.clear_all_controls();
         }
@@ -1546,7 +1626,7 @@ where
             scanner.reset();
             while let Some(idx) = scanner.next_in(&level.table) {
                 let entry = unsafe { level.table.take(idx) };
-                new_map.insert(entry.key, entry.value);
+                new_map.insert_unique(entry.key, entry.value);
             }
             level.table.clear_all_controls();
             level.len = 0;
@@ -1623,10 +1703,8 @@ where
         }
     }
 
-    /// Pick the (level, slot) pair to write a new key into. Tries the
-    /// batch-targeted level pair first (`choose_slot_targeted`); falls back
-    /// to a full sweep across all levels when the targeted slot is full
-    /// (e.g. tombstones in earlier levels are the only reusable slots).
+    /// Paper §4 places each insert in `A_i` or `A_{i+1}` per the current batch `B_i`;
+    /// The full-sweep fallback covers the tombstone-reuse case the paper's analysis doesn't model.
     #[inline]
     fn choose_slot_for_new_key(&mut self, key_hash: u64) -> Option<(usize, usize)> {
         if self.levels.is_empty() {
@@ -1645,11 +1723,14 @@ where
         None
     }
 
-    /// Batch-driven slot selection. Reads `current_batch_index` to pick the
-    /// level pair `(li, li+1)`, then steers between them based on
-    /// `current_free_slots > half_reserve_threshold` and `next_free_slots`
-    /// thresholds. Per the elastic-hashing schedule, this is what keeps
-    /// expected probe count low at high load.
+    /// Batch-driven slot selection per paper §4 Cases 1/2/3 during batch `B_i`:
+    /// - Case 1 (`ε₁ > δ/2` ∧ `ε₂ > 0.25`): limited probe in `A_i`, else uniform `A_{i+1}`.
+    /// - Case 2 (`ε₁ ≤ δ/2`): uniform `A_{i+1}`.
+    /// - Case 3 (`ε₂ ≤ 0.25`): uniform `A_i`.
+    ///
+    /// Cases 2 and 3 swap to the other level if the paper-mandated one is full.
+    /// Paper proves success w.h.p. but not w.p. 1,
+    /// so we avoid a hard insert failure on the rare bad event.
     #[inline]
     fn choose_slot_targeted(&self, key_hash: u64) -> Option<(usize, usize)> {
         if self.current_batch_index == 0 {
@@ -1702,9 +1783,9 @@ where
             .map(|slot_idx| (level_idx + 1, slot_idx))
     }
 
-    /// Locate `key` across all populated levels. Returns `(level, slot)` on
-    /// hit. Bounded by `max_populated_level + 1` so empty trailing levels
-    /// don't get probed.
+    /// Paper §4 lookup: walk levels `A_1`, `A_2`, … in order using each
+    /// level's probe sequence `h_{i,1}(x)`, `h_{i,2}(x)`, … until the key is
+    /// found or all populated levels are exhausted.
     #[inline]
     fn find_slot_indices_with_hash<Q>(
         &self,
@@ -1718,58 +1799,9 @@ where
     {
         let search_limit = (self.max_populated_level + 1).min(self.levels.len());
         for (level_idx, level) in self.levels[..search_limit].iter().enumerate() {
-            if let Some(slot_idx) =
-                Self::find_in_level_by_probe(key_hash, key_fingerprint, key, level)
-            {
+            if let Some(slot_idx) = level.find_by_probe(key_hash, key_fingerprint, key) {
                 return Some((level_idx, slot_idx));
             }
-        }
-        None
-    }
-
-    /// Probe one level for `key`. Walks groups via the level's intra-level
-    /// probe sequence (triangular for power-of-2 group counts, double-hash
-    /// step otherwise), SIMD-matches the fingerprint byte, then key-compares
-    /// only the matched slots. Stops on FREE byte (group has space) when no
-    /// tombstones exist.
-    #[inline]
-    fn find_in_level_by_probe<Q>(
-        key_hash: u64,
-        key_fingerprint: u8,
-        key: &Q,
-        level: &Level<K, V, A>,
-    ) -> Option<usize>
-    where
-        K: Borrow<Q>,
-        Q: Eq + ?Sized,
-    {
-        if level.len == 0 {
-            return None;
-        }
-
-        let group_count = level.table.group_count();
-        let mask = level.group_count_mask;
-        let mut group_idx = Self::triangular_group_start(level, key_hash);
-        let mut delta: usize = 0;
-
-        for _ in 0..group_count {
-            // Warm slot data while SIMD scan runs.
-            // SAFETY: `level.len > 0` ⇒ `capacity > 0`; `group_idx <
-            // group_count` ⇒ `group_idx * GROUP_SIZE < capacity`.
-            unsafe { level.table.prefetch_slot(group_idx * GROUP_SIZE) };
-            let match_mask = level.table.group_match_mask(group_idx, key_fingerprint);
-            for relative_idx in match_mask {
-                let slot_idx = group_idx * GROUP_SIZE + relative_idx;
-                let entry = unsafe { level.table.get_ref(slot_idx) };
-                if entry.key.borrow() == key {
-                    return Some(slot_idx);
-                }
-            }
-            if level.table.group_match_mask(group_idx, CTRL_EMPTY).any() {
-                return None;
-            }
-            delta += 1;
-            group_idx = (group_idx + delta) & mask;
         }
         None
     }
@@ -1792,7 +1824,7 @@ where
         let group_count = level.table.group_count();
         let max_groups = max_groups.min(group_count.max(1));
         let mask = level.group_count_mask;
-        let mut group_idx = Self::triangular_group_start(level, key_hash);
+        let mut group_idx = level.triangular_group_start(key_hash);
         let mut delta: usize = 0;
         for _ in 0..max_groups {
             if let Some(slot_idx) = level.table.first_free_in_group(group_idx) {
@@ -1815,7 +1847,7 @@ where
 
         let group_count = level.table.group_count();
         let mask = level.group_count_mask;
-        let mut group_idx = Self::triangular_group_start(level, key_hash);
+        let mut group_idx = level.triangular_group_start(key_hash);
         let mut delta: usize = 0;
         for _ in 0..group_count {
             if let Some(slot_idx) = level.table.first_free_in_group(group_idx) {
@@ -1825,14 +1857,6 @@ where
             group_idx = (group_idx + delta) & mask;
         }
         None
-    }
-
-    /// Triangular-probing starting group: `(key_hash ^ salt) & (group_count - 1)`.
-    /// `group_count` is pow2 by `partition_levels` construction.
-    #[inline]
-    fn triangular_group_start(level: &Level<K, V, A>, key_hash: u64) -> usize {
-        let mixed = key_hash ^ level.salt;
-        probe::hash_to_usize(mixed) & level.group_count_mask
     }
 
     /// After a remove, walk down `max_populated_level` past any now-empty
@@ -1974,10 +1998,10 @@ fn fill_probe_budgets(
     }
 }
 
-/// Split `total_capacity` into geometrically halving level sizes, then round
-/// each up so `group_count = size / GROUP_SIZE` is pow2 — required for the
-/// triangular probe path's `(idx + delta) & mask` wrap. Total slots may
-/// exceed `total_capacity` by up to ~2x. Returns `[]` for capacity 0.
+/// Paper §4: split into `|A_{i+1}| = |A_i|/2 ± 1`, then round each up so
+/// `group_count = size / GROUP_SIZE` is pow2 (triangular probe needs `(idx + delta) & mask` wrap).
+/// Total slots may exceed `total_capacity` by up to ~2x.
+/// Returns `[]` for capacity 0.
 fn partition_levels(total_capacity: usize) -> Vec<usize> {
     if total_capacity == 0 {
         return Vec::new();
@@ -2003,10 +2027,10 @@ fn partition_levels(total_capacity: usize) -> Vec<usize> {
         .collect()
 }
 
-/// Build the per-batch insertion quota that drives `current_batch_index`.
-/// Batch 0 fills level 0 to ~3/4 occupancy. Each subsequent batch tops up
-/// the previous level toward its reserve threshold while priming the next
-/// level. Total quota equals `max_insertions`.
+/// Paper §4: batch `B_0` fills `A_1` to `⌈0.75|A_1|⌉`;
+/// batch `B_i` (i ≥ 1) has `|A_i| - ⌊δ|A_i|/2⌋ - ⌈0.75|A_i|⌉ + ⌈0.75|A_{i+1}|⌉` insertions,
+/// leaving `A_i` at `(1 - δ/2)` full and `A_{i+1}` at 3/4 full (eq. 1).
+/// Total = `max_insertions`.
 fn build_batch_plan(
     level_capacities: &[usize],
     reserve_fraction: f64,
