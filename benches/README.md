@@ -16,12 +16,6 @@ Rust bench targets compare `std::collections::HashMap`, `hashbrown::HashMap`, `o
 
 ![Tail latency — get-hit @ 10M](../assets/latency-tail-10M-get-hit.svg)
 
-### Instructions per op (iai-callgrind, deterministic)
-
-Structural workload comparison — no CPU noise.
-
-![Instructions per op](../assets/benchmark-instr-count.svg)
-
 ### Python: opthash bindings vs builtin `dict`
 
 ![Python speedup chart](../assets/benchmark-python-speedup.svg)
@@ -44,6 +38,8 @@ cargo bench --bench speedup
 cargo bench --bench speedup -- "get_hit"          # Criterion name filter
 ```
 
+[.github/workflows/codspeed.yml](../.github/workflows/codspeed.yml) re-runs this bench under callgrind simulation per PR for deterministic instruction-count diffs.
+
 ## `benches/latency.rs` — tail-latency histograms (hdrhistogram)
 
 Captures per-operation latency distributions (p50/p90/p99/p999/p9999/max) and dumps them to JSON for plotting. Output: `target/latency/<map>/<size>/<op>.json`.
@@ -51,15 +47,6 @@ Captures per-operation latency distributions (p50/p90/p99/p999/p9999/max) and du
 ```bash
 cargo bench --bench latency
 ```
-
-## `benches/instr_count.rs` — deterministic instruction counts (iai-callgrind)
-
-```bash
-cargo install iai-callgrind-runner   # one-time
-cargo bench --bench instr_count
-```
-
-Output: `target/iai/opthash/instr_count/<group>/<bench>/callgrind.<bench>.out` — parsed by `scripts/generate_instr_count_chart.py` into `assets/benchmark-instr-count.svg`.
 
 ## `benches/python/throughput.py` — Python bindings vs builtin `dict` (pytest-benchmark)
 
@@ -85,7 +72,7 @@ py-spy record --native --rate 1000 --duration 8 \
 ## Reports
 
 - Criterion HTML: `target/criterion/report/index.html`, per-workload pages below (e.g. `target/criterion/insert_throughput/report/index.html`)
-- Charts: `uv run scripts/generate_all_charts.py` writes every SVG to `assets/` (speedup bars, mean-latency line, tail CDF, instructions-per-op bars, Python speedup bars)
+- Charts: `uv run scripts/generate_all_charts.py` writes every SVG to `assets/` (speedup bars, mean-latency line, tail CDF, Python speedup bars)
 
 ## Profiling / flamegraphs
 

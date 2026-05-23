@@ -67,7 +67,7 @@ uv run --group charts python scripts/generate_python_chart.py
 - **rust** — `cargo codspeed run --bench speedup`. The `criterion` dev-dep is a package rename to `codspeed-criterion-compat`; don't revert.
 - **python** — `pytest benches/python/throughput.py --codspeed`. `pytest-codspeed` is drop-in for `pytest-benchmark`.
 
-`latency.rs` and `instr_count.rs` are local-only. Sim counts instructions, not wallclock — `scripts/bench.sh` stays the local ground truth.
+`latency.rs` is local-only. Sim counts instructions, not wallclock — `scripts/bench.sh` stays the local ground truth.
 
 ### Charts
 
@@ -115,4 +115,4 @@ When spawning a worktree, name its branch after the work (e.g. `feat/std-parity-
 
 - Read the asm (`objdump -d`) on hot functions before factoring shared SIMD or arithmetic primitives. LLVM already CSEs same-pointer control-byte loads and folds duplicate masks; a "cleaner" abstraction may save nothing.
 - Adding a field to a hot struct (`RawTable`, `Level`) is a layout change. Downstream fields can shift across cache lines and regress lookups 15–20% with no semantic change. Measure offsets _and_ bench.
-- Pure refactors (rename, extract, no logic change) can swing 5–50% from icache and branch-predictor layout shifts. A no-op refactor should leave `cargo bench --bench instr_count` IR at ±0.
+- Pure refactors (rename, extract, no logic change) can swing 5–50% from icache and branch-predictor layout shifts. A no-op refactor should leave CodSpeed sim instr-count at ±0.
