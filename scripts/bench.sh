@@ -116,7 +116,7 @@ else
 fi
 
 if [[ "$BENCH" == "all" ]]; then
-	bench_targets=(speedup latency)
+	bench_targets=(speedup mean_latency tail_latency)
 else
 	bench_targets=("$BENCH")
 fi
