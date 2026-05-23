@@ -65,17 +65,20 @@ fn build_funnel_options(
     Ok(opts)
 }
 
-/// Type tag packed into `HashedAny::tagged`'s low bit so `PartialEq` can
-/// hit the str-vs-str fast path without re-running `Py_TYPE`.
-#[derive(Clone, Copy, PartialEq)]
+/// Type tag packed into `HashedAny::tagged`'s low bits so `PartialEq` skips
+/// `Py_TYPE` re-dispatch for str/str and int/int compares.
+#[derive(PartialEq, Eq)]
 #[repr(usize)]
 enum HashKind {
     Other = 0,
     Str = 1,
+    Int = 2,
 }
 
-/// Low-bit tag mask packing a [`HashKind`] into a `PyObject*` pointer.
-const KIND_MASK: usize = 0b1;
+/// Tag mask packing a [`HashKind`] into a `PyObject*` pointer. `CPython`
+/// aligns object headers to at least 8 bytes, so the low 3 bits are
+/// reliably zero — we use 2 of them.
+const KIND_MASK: usize = 0b11;
 
 /// Owning hashable wrapper for a `Py<PyAny>` map key. Caches `__hash__`
 /// and tag-packs `HashKind` into the pointer's low bit; 16B on 64-bit.
@@ -115,8 +118,11 @@ impl HashedAny {
     fn detect_kind(ob: &Bound<'_, PyAny>) -> HashKind {
         // SAFETY: `Bound` always holds a valid `PyObject*`.
         unsafe {
-            if ffi::Py_TYPE(ob.as_ptr()) == &raw mut ffi::PyUnicode_Type {
+            let ty = ffi::Py_TYPE(ob.as_ptr());
+            if ty == &raw mut ffi::PyUnicode_Type {
                 HashKind::Str
+            } else if ty == &raw mut ffi::PyLong_Type {
+                HashKind::Int
             } else {
                 HashKind::Other
             }
@@ -159,8 +165,10 @@ impl HashedAny {
         match (self.tagged.as_ptr() as usize) & KIND_MASK {
             x if x == HashKind::Other as usize => HashKind::Other,
             x if x == HashKind::Str as usize => HashKind::Str,
-            // SAFETY: `KIND_MASK == 0b1`, so the value is always 0 or 1.
-            // A new variant overlapping the mask must add an arm here.
+            x if x == HashKind::Int as usize => HashKind::Int,
+            // SAFETY: `KIND_MASK == 0b11` and every `HashKind` discriminant
+            // in [0, 3] has an arm above. A new variant overlapping the
+            // mask must add an arm here.
             _ => unsafe { std::hint::unreachable_unchecked() },
         }
     }
@@ -192,9 +200,9 @@ impl Drop for HashedAny {
     }
 }
 
-/// Borrow-only key wrapper for lookups (`get` / `contains_key` / `remove`).
-/// Wraps a `HashedAny` in `ManuallyDrop` so no refcount bump or `Py_DECREF`
-/// happens — the source `Bound` keeps the object live.
+/// Borrow-only key wrapper for non-owning lookups. Wraps a `HashedAny` in
+/// `ManuallyDrop` so no refcount bump or `Py_DECREF` happens — the source
+/// `Bound` keeps the object live.
 struct ProbeKey {
     inner: ManuallyDrop<HashedAny>,
 }
@@ -226,8 +234,9 @@ impl Hash for HashedAny {
 }
 
 impl PartialEq for HashedAny {
-    /// Three short-circuits before Python rich compare: hash mismatch,
-    /// pointer identity, and a UTF-8 bytes compare for str/str pairs.
+    /// Short-circuits before falling back to Python rich compare: hash
+    /// mismatch, pointer identity, then a kind-tagged fast path —
+    /// str/str via UTF-8 bytes and int/int via `PyLong_AsLongLongAndOverflow`.
     fn eq(&self, other: &Self) -> bool {
         if self.hash != other.hash {
             return false;
@@ -235,16 +244,35 @@ impl PartialEq for HashedAny {
         if self.obj_ptr() == other.obj_ptr() {
             return true;
         }
+        let sk = self.kind();
+        let ok = other.kind();
         Python::attach(|py| {
             // Direct UTF-8 compare bypasses PyObject_RichCompareBool dispatch.
-            if self.kind() == HashKind::Str
-                && other.kind() == HashKind::Str
+            if sk == HashKind::Str
+                && ok == HashKind::Str
                 && let Ok(sa) = self.obj_borrowed(py).cast::<PyString>()
                 && let Ok(sb) = other.obj_borrowed(py).cast::<PyString>()
                 && let Ok(x) = sa.to_str()
                 && let Ok(y) = sb.to_str()
             {
                 return x == y;
+            }
+            // Int/int: try `c_longlong` direct compare; fall through to rich
+            // compare only when both sides overflow in the same direction.
+            if sk == HashKind::Int && ok == HashKind::Int {
+                let mut ovf_a: std::ffi::c_int = 0;
+                let mut ovf_b: std::ffi::c_int = 0;
+                // SAFETY: kind tag guarantees both are PyLong.
+                let a =
+                    unsafe { ffi::PyLong_AsLongLongAndOverflow(self.obj_ptr(), &raw mut ovf_a) };
+                let b =
+                    unsafe { ffi::PyLong_AsLongLongAndOverflow(other.obj_ptr(), &raw mut ovf_b) };
+                if ovf_a == 0 && ovf_b == 0 {
+                    return a == b;
+                }
+                if ovf_a != ovf_b {
+                    return false;
+                }
             }
             self.obj_borrowed(py)
                 .eq(other.obj_borrowed(py))
@@ -429,7 +457,9 @@ macro_rules! define_map_classes {
             }
 
             fn clear(&mut self) {
-                self.inner.clear();
+                // One outer attach so per-entry `HashedAny::drop` hits the
+                // cheap already-attached path instead of re-acquiring GIL state.
+                Python::attach(|_py| self.inner.clear());
                 self.bump();
             }
 
@@ -444,7 +474,11 @@ macro_rules! define_map_classes {
             fn __iter__(slf: Bound<'_, Self>) -> $KeyIter {
                 let py = slf.py();
                 let m = slf.borrow();
-                let snapshot = m.inner.iter().map(|(k, _)| k.obj_clone_ref(py)).collect();
+                let snapshot = m
+                    .inner
+                    .iter()
+                    .map(|(k, _)| Some(k.obj_clone_ref(py)))
+                    .collect();
                 let expected_gen = m.generation;
                 drop(m);
                 $KeyIter {
@@ -706,7 +740,11 @@ macro_rules! define_map_classes {
         impl $KeysView {
             fn __iter__(&self, py: Python<'_>) -> $KeyIter {
                 let m = self.map.borrow(py);
-                let snapshot = m.inner.iter().map(|(k, _)| k.obj_clone_ref(py)).collect();
+                let snapshot = m
+                    .inner
+                    .iter()
+                    .map(|(k, _)| Some(k.obj_clone_ref(py)))
+                    .collect();
                 $KeyIter {
                     map: self.map.clone_ref(py),
                     snapshot,
@@ -820,7 +858,7 @@ macro_rules! define_map_classes {
         impl $ValuesView {
             fn __iter__(&self, py: Python<'_>) -> $ValueIter {
                 let m = self.map.borrow(py);
-                let snapshot = m.inner.iter().map(|(_, v)| v.clone_ref(py)).collect();
+                let snapshot = m.inner.iter().map(|(_, v)| Some(v.clone_ref(py))).collect();
                 $ValueIter {
                     map: self.map.clone_ref(py),
                     snapshot,
@@ -865,12 +903,12 @@ macro_rules! define_map_classes {
         impl $ItemsView {
             fn __iter__(&self, py: Python<'_>) -> PyResult<$ItemIter> {
                 let m = self.map.borrow(py);
-                let snapshot: PyResult<Vec<Py<PyAny>>> = m
+                let snapshot: PyResult<Vec<Option<Py<PyAny>>>> = m
                     .inner
                     .iter()
                     .map(|(k, v)| {
                         let tup = PyTuple::new(py, [k.obj_clone_ref(py), v.clone_ref(py)])?;
-                        Ok(tup.into_any().unbind())
+                        Ok(Some(tup.into_any().unbind()))
                     })
                     .collect();
                 Ok($ItemIter {
@@ -975,15 +1013,18 @@ macro_rules! define_map_classes {
 }
 
 /// One iterator pyclass. `snapshot` is materialized eagerly at `__iter__`
-/// (trades memory for no self-referencing borrow). `__next__` checks the
-/// map's `generation` against `expected_gen` and raises `RuntimeError`
-/// on mismatch.
+/// (trades memory for no self-referencing borrow). `__next__` checks
+/// `expected_gen` against the map's `generation` and raises on mismatch.
+///
+/// Slot type is `Option<Py<PyAny>>` (niche-packed, same size as `Py`); each
+/// `__next__` `.take()`s the slot rather than cloning — saves one atomic
+/// refcount bump per yield.
 macro_rules! define_iter {
     ($Iter:ident, $iter_name:literal, $PyMap:ident) => {
         #[pyclass(name = $iter_name, module = "opthash")]
         struct $Iter {
             map: Py<$PyMap>,
-            snapshot: Vec<Py<PyAny>>,
+            snapshot: Vec<Option<Py<PyAny>>>,
             expected_gen: u64,
             pos: usize,
         }
@@ -999,12 +1040,11 @@ macro_rules! define_iter {
                         "dictionary changed size during iteration",
                     ));
                 }
-                if self.pos >= self.snapshot.len() {
+                let Some(slot) = self.snapshot.get_mut(self.pos) else {
                     return Ok(None);
-                }
-                let v = self.snapshot[self.pos].clone_ref(py);
+                };
                 self.pos += 1;
-                Ok(Some(v))
+                Ok(slot.take())
             }
         }
     };
