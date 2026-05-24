@@ -15,6 +15,19 @@ permissions:
   contents: read
 
 jobs:
+  conclusion:
+    needs: [pre-commit, rust-test, msrv, python-test, miri]
+    # !cancelled() executes the job regardless of whether the previous jobs passed, failed or get skipped.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Conclusion
+        run: |
+          # Print the dependent jobs to see them in the CI log
+          jq -C <<< '${{ toJson(needs) }}'
+          # Check if all jobs that we depend on (in the needs array) were successful.
+          jq --exit-status 'all(.result == "success")' <<< '${{ toJson(needs) }}'
+
   pre-commit:
     runs-on: ubuntu-latest
     steps:
@@ -31,20 +44,40 @@ jobs:
           key: pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}
       - run: uvx pre-commit run --all-files --show-diff-on-failure
 
-  rust:
+  rust-test:
+    needs: pre-commit
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        channel: [stable, nightly]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.channel }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test
+      - name: Test (nightly)
+        if: matrix.channel == 'nightly'
+        run: cargo test --features nightly
+
+  msrv:
     needs: pre-commit
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
         with:
-          components: clippy
-      - name: Clippy
-        run: cargo clippy --features python -- -W clippy::pedantic
-      - name: Test
-        run: cargo test
+          tool: cargo-msrv
+      - name: Verify MSRV
+        run: cargo msrv verify
 
-  python:
+  python-test:
     needs: pre-commit
     runs-on: ubuntu-latest
     steps:
@@ -64,7 +97,7 @@ jobs:
           uv run pytest tests/
 
   miri:
-    needs: rust
+    needs: rust-test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
