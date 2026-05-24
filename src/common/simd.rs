@@ -5,8 +5,9 @@ use std::arch::x86_64::{self, __m128i, __m256i, _MM_HINT_T0};
 
 use super::bitmask::BitMask;
 use super::config::GROUP_SIZE;
-#[allow(unused_imports)]
-use super::control::{CTRL_EMPTY, CTRL_TOMBSTONE, FINGERPRINT_MASK};
+use super::control::FINGERPRINT_MASK;
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+use super::control::{CTRL_EMPTY, CTRL_TOMBSTONE};
 
 /// 1-bit-per-byte u32 mask over a 16-byte chunk
 #[inline]
