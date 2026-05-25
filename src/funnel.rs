@@ -543,7 +543,7 @@ impl<K: Clone, V: Clone, A: Allocator + Clone> Clone for SpecialArray<K, V, A> {
 
 /// Where in the funnel structure a key/slot lives. Returned by lookups,
 /// consumed by inserts / removes to avoid recomputing the location.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SlotLocation {
     Level { level_idx: usize, slot_idx: usize },
     SpecialPrimary { slot_idx: usize },
@@ -2435,6 +2435,12 @@ impl<'a, K, V, A: Allocator + Clone> Iterator for FunnelTables<'a, K, V, A> {
     }
 }
 
+impl<K, V, A: Allocator + Clone> fmt::Debug for FunnelTables<'_, K, V, A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FunnelTables").finish_non_exhaustive()
+    }
+}
+
 /// Borrowing iterator over occupied entries. Visits bucket levels → special
 /// primary → special fallback. SIMD-scans one group at a time via
 /// [`OccupiedCursor`], yielding bits from a cached mask before refilling.
@@ -3531,7 +3537,6 @@ mod tests {
             }
             fn write(&mut self, _: &[u8]) {}
         }
-        #[derive(Default, Clone)]
         struct ConstHashBuilder;
         impl std::hash::BuildHasher for ConstHashBuilder {
             type Hasher = ConstHasher;
@@ -3545,14 +3550,14 @@ mod tests {
         assert!(map.levels.len() > 1, "test requires multi-level layout");
         let l0_bucket_size = i32::try_from(1usize << map.levels[0].bucket_size_log2).unwrap();
         // bucket holds at most l0_bucket_size; one more forces a spill.
-        for i in 0..=(l0_bucket_size) {
+        for i in 0..=l0_bucket_size {
             map.insert(i, i);
         }
         assert_eq!(
             map.max_populated_level, 1,
             "first bucket overflow should land in A_1, not the special array"
         );
-        for i in 0..=(l0_bucket_size) {
+        for i in 0..=l0_bucket_size {
             assert_eq!(map.get(&i), Some(&i));
         }
     }
