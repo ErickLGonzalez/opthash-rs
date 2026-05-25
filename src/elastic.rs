@@ -6,9 +6,7 @@ use std::marker::PhantomData;
 use std::mem;
 use std::ptr;
 
-use crate::common::config::{
-    DEFAULT_PROBE_SCALE, DEFAULT_RESERVE_FRACTION, GROUP_SIZE, GROUP_SIZE_F64, INITIAL_CAPACITY,
-};
+use crate::common::config::{DEFAULT_RESERVE_FRACTION, GROUP_SIZE, INITIAL_CAPACITY};
 use crate::common::control::{self, CTRL_EMPTY, CTRL_TOMBSTONE, ControlByte};
 use crate::common::error::{EntryView, OccupiedError as CommonOccupiedError};
 use crate::common::iter::{
@@ -28,9 +26,6 @@ pub struct ElasticOptions {
     /// Fraction of slots kept free as headroom. Lower means higher load
     /// factor but more probing on collisions.
     reserve_fraction: f64,
-    /// Multiplier on per-level probe budgets. Higher means more thorough
-    /// probing within a level before falling through to the next.
-    probe_scale: f64,
 }
 
 impl Default for ElasticOptions {
@@ -38,7 +33,6 @@ impl Default for ElasticOptions {
         Self {
             capacity: 0,
             reserve_fraction: DEFAULT_RESERVE_FRACTION,
-            probe_scale: DEFAULT_PROBE_SCALE,
         }
     }
 }
@@ -63,12 +57,6 @@ impl ElasticOptions {
         self.reserve_fraction = reserve_fraction;
         self
     }
-
-    #[must_use]
-    pub fn probe_scale(mut self, probe_scale: f64) -> Self {
-        self.probe_scale = probe_scale;
-        self
-    }
 }
 
 /// One sub-array `A_i` in paper §4's partition `|A_{i+1}| = |A_i|/2 ± 1`.
@@ -88,9 +76,7 @@ struct Level<K, V, A: Allocator + Clone = Global> {
     /// Cached `floor(reserve * cap / 2)` for the
     /// `current_free_slots > threshold` branch in slot selection.
     half_reserve_slot_threshold: usize,
-    /// Paper §2 `c` in `f(ε) = c·log²(ε⁻¹)` — `probe_scale / GROUP_SIZE`.
-    probe_scale_over_group_size: f64,
-    /// Paper §2 cap on `f(ε)` — `min(1 + c·log δ⁻¹, group_count)`.
+    /// Paper §2 cap on `f(ε)` — `min(1 + log δ⁻¹, group_count)` with `c = 1`.
     budget_cap: f64,
 }
 
@@ -98,7 +84,6 @@ impl<K, V, A: Allocator + Clone> Level<K, V, A> {
     fn with_capacity_in(
         capacity: usize,
         reserve_fraction: f64,
-        probe_scale: f64,
         level_idx: usize,
         alloc: A,
     ) -> Self {
@@ -108,9 +93,7 @@ impl<K, V, A: Allocator + Clone> Level<K, V, A> {
             group_count == 0 || group_count.is_power_of_two(),
             "partition_levels must produce pow2 group_count",
         );
-        let probe_scale_over_group_size = probe_scale / GROUP_SIZE_F64;
-        let budget_cap =
-            compute_budget_cap(probe_scale_over_group_size, reserve_fraction, group_count);
+        let budget_cap = compute_budget_cap(reserve_fraction, group_count);
         Self {
             table,
             len: 0,
@@ -121,7 +104,6 @@ impl<K, V, A: Allocator + Clone> Level<K, V, A> {
                 reserve_fraction,
                 capacity,
             ),
-            probe_scale_over_group_size,
             budget_cap,
         }
     }
@@ -130,16 +112,13 @@ impl<K, V, A: Allocator + Clone> Level<K, V, A> {
     fn try_with_capacity_in(
         capacity: usize,
         reserve_fraction: f64,
-        probe_scale: f64,
         level_idx: usize,
         alloc: A,
     ) -> Result<Self, TryReserveError> {
         let table =
             RawTable::try_new_in(capacity, alloc).map_err(|()| TryReserveError::AllocError)?;
         let group_count = table.group_count();
-        let probe_scale_over_group_size = probe_scale / GROUP_SIZE_F64;
-        let budget_cap =
-            compute_budget_cap(probe_scale_over_group_size, reserve_fraction, group_count);
+        let budget_cap = compute_budget_cap(reserve_fraction, group_count);
         Ok(Self {
             table,
             len: 0,
@@ -150,7 +129,6 @@ impl<K, V, A: Allocator + Clone> Level<K, V, A> {
                 reserve_fraction,
                 capacity,
             ),
-            probe_scale_over_group_size,
             budget_cap,
         })
     }
@@ -180,7 +158,7 @@ impl<K, V, A: Allocator + Clone> Level<K, V, A> {
             return 1;
         }
         let log_inv_eps = (capacity as f64 / free_slots as f64).log2();
-        let raw = 1.0 + self.probe_scale_over_group_size * log_inv_eps * log_inv_eps;
+        let raw = 1.0 + log_inv_eps * log_inv_eps;
         raw.min(self.budget_cap) as usize
     }
 
@@ -244,7 +222,6 @@ impl<K: Clone, V: Clone, A: Allocator + Clone> Clone for Level<K, V, A> {
             group_count_mask: self.group_count_mask,
             tombstones: self.tombstones,
             half_reserve_slot_threshold: self.half_reserve_slot_threshold,
-            probe_scale_over_group_size: self.probe_scale_over_group_size,
             budget_cap: self.budget_cap,
         }
     }
@@ -256,7 +233,6 @@ impl<K: Clone, V: Clone, A: Allocator + Clone> Clone for Level<K, V, A> {
         self.group_count_mask = source.group_count_mask;
         self.tombstones = source.tombstones;
         self.half_reserve_slot_threshold = source.half_reserve_slot_threshold;
-        self.probe_scale_over_group_size = source.probe_scale_over_group_size;
         self.budget_cap = source.budget_cap;
     }
 }
@@ -279,8 +255,6 @@ pub struct ElasticHashMap<K, V, S = DefaultHashBuilder, A: Allocator + Clone = G
     max_insertions: usize,
     /// Slot reserve fraction per level. See `ElasticOptions`.
     reserve_fraction: f64,
-    /// Probe-budget multiplier. See `ElasticOptions`.
-    probe_scale: f64,
     /// Per-batch insert quota; drives `current_batch_index` advancement.
     batch_plan: Box<[usize]>,
     /// Index into `batch_plan`. Selects which level pair new keys target.
@@ -419,7 +393,6 @@ where
     #[must_use]
     pub fn with_options_and_hasher_in(options: ElasticOptions, hash_builder: S, alloc: A) -> Self {
         let reserve_fraction = capacity::sanitize_reserve_fraction(options.reserve_fraction);
-        let probe_scale = sanitize_probe_scale(options.probe_scale);
         let capacity = if options.capacity == 0 {
             0
         } else {
@@ -433,13 +406,7 @@ where
             .iter()
             .enumerate()
             .map(|(level_idx, &cap)| {
-                Level::with_capacity_in(
-                    cap,
-                    reserve_fraction,
-                    probe_scale,
-                    level_idx,
-                    alloc.clone(),
-                )
+                Level::with_capacity_in(cap, reserve_fraction, level_idx, alloc.clone())
             })
             .collect();
 
@@ -452,7 +419,6 @@ where
             capacity,
             max_insertions,
             reserve_fraction,
-            probe_scale,
             batch_plan,
             current_batch_index: 0,
             batch_remaining,
@@ -1645,13 +1611,7 @@ where
             .iter()
             .enumerate()
             .map(|(level_idx, &cap)| {
-                Level::with_capacity_in(
-                    cap,
-                    self.reserve_fraction,
-                    self.probe_scale,
-                    level_idx,
-                    self.alloc.clone(),
-                )
+                Level::with_capacity_in(cap, self.reserve_fraction, level_idx, self.alloc.clone())
             })
             .collect();
         let new_max_insertions = capacity::max_insertions(new_capacity, self.reserve_fraction);
@@ -1690,7 +1650,6 @@ where
             ElasticOptions {
                 capacity: new_capacity,
                 reserve_fraction: self.reserve_fraction,
-                probe_scale: self.probe_scale,
             },
             hash_builder,
             self.alloc.clone(),
@@ -1720,7 +1679,6 @@ where
         alloc: A,
     ) -> Result<Self, TryReserveError> {
         let reserve_fraction = capacity::sanitize_reserve_fraction(options.reserve_fraction);
-        let probe_scale = sanitize_probe_scale(options.probe_scale);
         let capacity = options.capacity;
         let max_insertions = capacity::max_insertions(capacity, reserve_fraction);
 
@@ -1733,7 +1691,6 @@ where
             levels.push(Level::try_with_capacity_in(
                 cap,
                 reserve_fraction,
-                probe_scale,
                 level_idx,
                 alloc.clone(),
             )?);
@@ -1749,7 +1706,6 @@ where
             capacity,
             max_insertions,
             reserve_fraction,
-            probe_scale,
             batch_plan,
             current_batch_index: 0,
             batch_remaining,
@@ -1996,22 +1952,10 @@ fn check_disjoint_aliasing<const N: usize>(locations: &[Option<(usize, usize)>; 
     }
 }
 
-fn sanitize_probe_scale(probe_scale: f64) -> f64 {
-    if probe_scale.is_finite() && probe_scale > 0.0 {
-        probe_scale
-    } else {
-        DEFAULT_PROBE_SCALE
-    }
-}
-
-/// `min(1 + c·log δ⁻¹, group_count)` — paper §2 cap on `f(ε)`.
+/// `min(1 + log δ⁻¹, group_count)` — paper §2 cap on `f(ε)` with `c = 1`.
 #[allow(clippy::cast_precision_loss)]
-fn compute_budget_cap(
-    probe_scale_over_group_size: f64,
-    reserve_fraction: f64,
-    group_count: usize,
-) -> f64 {
-    let log_cap = 1.0 + probe_scale_over_group_size * (1.0 / reserve_fraction).log2();
+fn compute_budget_cap(reserve_fraction: f64, group_count: usize) -> f64 {
+    let log_cap = 1.0 + (1.0 / reserve_fraction).log2();
     let max_budget = group_count.max(1) as f64;
     log_cap.min(max_budget).max(1.0)
 }
@@ -2111,7 +2055,6 @@ where
             capacity: self.capacity,
             max_insertions: self.max_insertions,
             reserve_fraction: self.reserve_fraction,
-            probe_scale: self.probe_scale,
             batch_plan: self.batch_plan.clone(),
             current_batch_index: self.current_batch_index,
             batch_remaining: self.batch_remaining,
@@ -2139,7 +2082,6 @@ where
         self.len = source.len;
         self.max_insertions = source.max_insertions;
         self.reserve_fraction = source.reserve_fraction;
-        self.probe_scale = source.probe_scale;
         self.batch_plan.clone_from(&source.batch_plan);
         self.current_batch_index = source.current_batch_index;
         self.batch_remaining = source.batch_remaining;

@@ -29,9 +29,6 @@ pub struct FunnelOptions {
     /// Fraction kept free as headroom. Clamped to
     /// `MAX_FUNNEL_RESERVE_FRACTION` (1/8).
     reserve_fraction: f64,
-    /// Max groups probed in the special-array primary before falling back to
-    /// the fallback array. `None` derives from `reserve_fraction`.
-    primary_probe_limit: Option<usize>,
 }
 
 impl Default for FunnelOptions {
@@ -39,7 +36,6 @@ impl Default for FunnelOptions {
         Self {
             capacity: 0,
             reserve_fraction: DEFAULT_RESERVE_FRACTION,
-            primary_probe_limit: None,
         }
     }
 }
@@ -62,12 +58,6 @@ impl FunnelOptions {
     #[must_use]
     pub fn reserve_fraction(mut self, reserve_fraction: f64) -> Self {
         self.reserve_fraction = reserve_fraction;
-        self
-    }
-
-    #[must_use]
-    pub fn primary_probe_limit(mut self, primary_probe_limit: usize) -> Self {
-        self.primary_probe_limit = Some(primary_probe_limit);
         self
     }
 }
@@ -758,10 +748,7 @@ where
 
         let level_count = compute_level_count(reserve_fraction);
         let bucket_width = align::round_up_to_group(compute_bucket_width(reserve_fraction));
-        let primary_probe_limit = options
-            .primary_probe_limit
-            .unwrap_or_else(|| probe::log_log_probe_limit(capacity))
-            .max(1);
+        let primary_probe_limit = probe::log_log_probe_limit(capacity).max(1);
 
         let mut special_capacity =
             choose_special_capacity(capacity, reserve_fraction, bucket_width);
@@ -1456,7 +1443,6 @@ where
             FunnelOptions {
                 capacity: target,
                 reserve_fraction: self.reserve_fraction,
-                primary_probe_limit: Some(self.primary_probe_limit),
             },
             self.hash_builder.clone(),
             self.alloc.clone(),
@@ -1488,7 +1474,6 @@ where
                 FunnelOptions {
                     capacity: target,
                     reserve_fraction: self.reserve_fraction,
-                    primary_probe_limit: Some(self.primary_probe_limit),
                 },
                 self.hash_builder.clone(),
                 self.alloc.clone(),
@@ -1510,10 +1495,7 @@ where
 
         let level_count = compute_level_count(reserve_fraction);
         let bucket_width = align::round_up_to_group(compute_bucket_width(reserve_fraction));
-        let primary_probe_limit = options
-            .primary_probe_limit
-            .unwrap_or_else(|| probe::log_log_probe_limit(capacity))
-            .max(1);
+        let primary_probe_limit = probe::log_log_probe_limit(capacity).max(1);
 
         let mut special_capacity =
             choose_special_capacity(capacity, reserve_fraction, bucket_width);
@@ -1647,15 +1629,17 @@ where
                 )
             })
             .collect();
+        let new_primary_probe_limit = probe::log_log_probe_limit(new_capacity).max(1);
         let new_special = SpecialArray::with_capacity_in(
             special_capacity,
-            self.primary_probe_limit,
+            new_primary_probe_limit,
             self.alloc.clone(),
         );
         self.levels = new_levels;
         self.special = new_special;
         self.capacity = new_capacity;
         self.max_insertions = capacity::max_insertions(new_capacity, self.reserve_fraction);
+        self.primary_probe_limit = new_primary_probe_limit;
         self.max_populated_level = 0;
     }
 
@@ -3602,13 +3586,5 @@ mod tests {
             "reserve_fraction={} not clamped to {MAX_FUNNEL_RESERVE_FRACTION}",
             map.reserve_fraction
         );
-    }
-
-    #[test]
-    fn primary_probe_limit_override_takes_effect() {
-        // Explicit override skips the log-log derivation.
-        let map: FunnelHashMap<i32, i32> =
-            FunnelHashMap::with_options(FunnelOptions::with_capacity(1024).primary_probe_limit(7));
-        assert_eq!(map.primary_probe_limit, 7);
     }
 }
