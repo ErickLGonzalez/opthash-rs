@@ -271,8 +271,8 @@ impl<K: Clone, V: Clone, A: Allocator + Clone> Clone for BucketLevel<K, V, A> {
     }
 }
 
-/// Odd-step probe over pow2 group count (paper §5 `SpecialPrimary`). Step is
-/// coprime to `group_count` ⇒ visits every group within `group_count` advances.
+/// Per-key odd-step probe over pow2 group count (paper §5 `SpecialPrimary`).
+/// Step coprime to `group_count` ⇒ permutation over all groups.
 struct ProbeSeq {
     group: usize,
     step: usize,
@@ -1445,60 +1445,55 @@ where
         self.max_populated_level = 0;
     }
 
-    /// Fallible counterpart to [`Self::resize`]. Allocates the new map
-    /// before touching `self`, so `Err` leaves the map intact.
+    /// Fallible counterpart to [`Self::resize`]. Common path leaves `self`
+    /// intact on `Err`; a failing 2x-retry allocation may empty `self`.
     fn try_resize(&mut self, new_capacity: usize) -> Result<(), TryReserveError>
     where
         S: Clone,
     {
-        let hash_builder = self.hash_builder.clone();
+        let mut target = new_capacity;
         let mut new_map = Self::try_with_options_and_hasher_in(
             FunnelOptions {
-                capacity: new_capacity,
+                capacity: target,
                 reserve_fraction: self.reserve_fraction,
                 primary_probe_limit: Some(self.primary_probe_limit),
             },
-            hash_builder,
+            self.hash_builder.clone(),
             self.alloc.clone(),
         )?;
 
-        for level in &mut self.levels {
-            level.table.for_each_occupied_mut(|table, idx| {
-                let entry = unsafe { table.take(idx) };
-                new_map.insert_new_entry_unchecked(entry.key, entry.value);
-            });
-            level.table.clear_all_controls();
-            level.len = 0;
-            level.tombstones = 0;
+        let mut entries: Vec<(K, V)> = Vec::new();
+        entries
+            .try_reserve(self.len)
+            .map_err(|_| TryReserveError::AllocError)?;
+        self.drain_entries_into(&mut entries);
+
+        loop {
+            let mut overflow: Vec<(K, V)> = Vec::new();
+            for (k, v) in entries.drain(..) {
+                if let Err(pair) = new_map.try_insert_new_entry_unchecked(k, v) {
+                    overflow.push(pair);
+                }
+            }
+            if overflow.is_empty() {
+                *self = new_map;
+                return Ok(());
+            }
+            new_map.drain_entries_into(&mut overflow);
+            entries = overflow;
+            target = target
+                .checked_mul(2)
+                .ok_or(TryReserveError::CapacityOverflow)?;
+            new_map = Self::try_with_options_and_hasher_in(
+                FunnelOptions {
+                    capacity: target,
+                    reserve_fraction: self.reserve_fraction,
+                    primary_probe_limit: Some(self.primary_probe_limit),
+                },
+                self.hash_builder.clone(),
+                self.alloc.clone(),
+            )?;
         }
-
-        self.special
-            .primary
-            .table
-            .for_each_occupied_mut(|table, idx| {
-                let entry = unsafe { table.take(idx) };
-                new_map.insert_new_entry_unchecked(entry.key, entry.value);
-            });
-        self.special.primary.table.clear_all_controls();
-        self.special.primary.len = 0;
-        self.special.primary.tombstones = 0;
-
-        self.special
-            .fallback
-            .table
-            .for_each_occupied_mut(|table, idx| {
-                let entry = unsafe { table.take(idx) };
-                new_map.insert_new_entry_unchecked(entry.key, entry.value);
-            });
-        self.special.fallback.table.clear_all_controls();
-        self.special.fallback.len = 0;
-        self.special.fallback.tombstones = 0;
-        self.special.total_len = 0;
-
-        self.len = 0;
-        self.max_populated_level = 0;
-        *self = new_map;
-        Ok(())
     }
 
     /// Fallible counterpart to [`Self::with_options_and_hasher_in`]. Returns
@@ -1565,10 +1560,69 @@ where
         })
     }
 
-    /// Drain all live entries (across levels + special), rebuild levels +
-    /// special in-place at `new_capacity`, reinsert. Also serves as a
-    /// no-grow rehash when called with the current capacity.
-    fn resize(&mut self, new_capacity: usize) {
+    /// Rebuild in-place at `new_capacity`. Doubles `new_capacity` on
+    /// insert overflow (funnel's structural failure mode under adversarial
+    /// hashing) until every entry places.
+    fn resize(&mut self, mut new_capacity: usize) {
+        let mut entries: Vec<(K, V)> = Vec::with_capacity(self.len);
+        self.drain_entries_into(&mut entries);
+        loop {
+            self.install_fresh_storage(new_capacity);
+            let mut overflow: Vec<(K, V)> = Vec::new();
+            for (k, v) in entries.drain(..) {
+                if let Err(pair) = self.try_insert_new_entry_unchecked(k, v) {
+                    overflow.push(pair);
+                }
+            }
+            if overflow.is_empty() {
+                return;
+            }
+            entries = overflow;
+            self.drain_entries_into(&mut entries);
+            new_capacity = new_capacity
+                .checked_mul(2)
+                .expect("capacity overflow during funnel resize retry");
+        }
+    }
+
+    /// Move every live entry into `out`; storage stays allocated but empty.
+    fn drain_entries_into(&mut self, out: &mut Vec<(K, V)>) {
+        for level in &mut self.levels {
+            level.table.for_each_occupied_mut(|table, idx| {
+                let entry = unsafe { table.take(idx) };
+                out.push((entry.key, entry.value));
+            });
+            level.table.clear_all_controls();
+            level.len = 0;
+            level.tombstones = 0;
+        }
+        self.special
+            .primary
+            .table
+            .for_each_occupied_mut(|table, idx| {
+                let entry = unsafe { table.take(idx) };
+                out.push((entry.key, entry.value));
+            });
+        self.special.primary.table.clear_all_controls();
+        self.special.primary.len = 0;
+        self.special.primary.tombstones = 0;
+        self.special
+            .fallback
+            .table
+            .for_each_occupied_mut(|table, idx| {
+                let entry = unsafe { table.take(idx) };
+                out.push((entry.key, entry.value));
+            });
+        self.special.fallback.table.clear_all_controls();
+        self.special.fallback.len = 0;
+        self.special.fallback.tombstones = 0;
+        self.special.total_len = 0;
+        self.len = 0;
+        self.max_populated_level = 0;
+    }
+
+    /// Replace `self`'s tables with empty storage sized for `new_capacity`.
+    fn install_fresh_storage(&mut self, new_capacity: usize) {
         let level_count = compute_level_count(self.reserve_fraction);
         let bucket_width = align::round_up_to_group(compute_bucket_width(self.reserve_fraction));
         let mut special_capacity =
@@ -1598,38 +1652,11 @@ where
             self.primary_probe_limit,
             self.alloc.clone(),
         );
-
-        // Swap new storage in; old move local for draining.
-        let old_levels = std::mem::replace(&mut self.levels, new_levels);
-        let old_special = std::mem::replace(&mut self.special, new_special);
+        self.levels = new_levels;
+        self.special = new_special;
         self.capacity = new_capacity;
         self.max_insertions = capacity::max_insertions(new_capacity, self.reserve_fraction);
         self.max_populated_level = 0;
-        self.len = 0;
-
-        // `take` leaves ctrl stale; clear so Drop doesn't double-drop.
-        for mut level in old_levels {
-            level.table.for_each_occupied_mut(|table, idx| {
-                let entry = unsafe { table.take(idx) };
-                self.insert_new_entry_unchecked(entry.key, entry.value);
-            });
-            level.table.clear_all_controls();
-        }
-        let SpecialArray {
-            mut primary,
-            mut fallback,
-            total_len: _,
-        } = old_special;
-        primary.table.for_each_occupied_mut(|table, idx| {
-            let entry = unsafe { table.take(idx) };
-            self.insert_new_entry_unchecked(entry.key, entry.value);
-        });
-        primary.table.clear_all_controls();
-        fallback.table.for_each_occupied_mut(|table, idx| {
-            let entry = unsafe { table.take(idx) };
-            self.insert_new_entry_unchecked(entry.key, entry.value);
-        });
-        fallback.table.clear_all_controls();
     }
 
     #[inline]
@@ -1732,14 +1759,17 @@ where
         }
     }
 
+    /// Place a known-novel `key`/`value`. Returns `Err((key, value))` if no
+    /// slot is available; the resize loop reclaims and retries at 2x.
     #[inline]
-    fn insert_new_entry_unchecked(&mut self, key: K, value: V) {
+    fn try_insert_new_entry_unchecked(&mut self, key: K, value: V) -> Result<(), (K, V)> {
         let key_hash = self.hash_key(&key);
         let key_fingerprint = control::control_fingerprint(key_hash);
-        let location = self
-            .choose_slot_for_new_key(key_hash)
-            .expect("resized funnel map should have free slot");
+        let Some(location) = self.choose_slot_for_new_key(key_hash) else {
+            return Err((key, value));
+        };
         self.place_new_entry(location, key, value, key_fingerprint);
+        Ok(())
     }
 
     #[inline]

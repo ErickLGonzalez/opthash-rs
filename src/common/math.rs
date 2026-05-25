@@ -116,6 +116,30 @@ pub(crate) mod probe {
     pub(crate) fn hash_to_usize(hash: u64) -> usize {
         hash as usize
     }
+
+    /// Triangular probe over a pow2-sized group count. Visits every group
+    /// exactly once (same scheme as hashbrown / `SwissTable`).
+    #[derive(Debug, Clone, Copy)]
+    pub(crate) struct TriangularProbe {
+        pub(crate) pos: usize,
+        delta: usize,
+    }
+
+    impl TriangularProbe {
+        #[inline]
+        pub(crate) fn new(start: usize) -> Self {
+            Self {
+                pos: start,
+                delta: 0,
+            }
+        }
+
+        #[inline]
+        pub(crate) fn advance(&mut self, mask: usize) {
+            self.delta += 1;
+            self.pos = (self.pos + self.delta) & mask;
+        }
+    }
 }
 
 /// Knuth multiplicative-hash constant (golden ratio * 2^64, odd).
