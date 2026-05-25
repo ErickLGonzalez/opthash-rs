@@ -118,28 +118,6 @@ command -v cargo >/dev/null 2>&1 || {
 	exit 1
 }
 
-if [[ -n "$LOAD" ]]; then
-	criterion_args=(--load-baseline "$LOAD" --baseline "${BASELINE:-ref}")
-elif [[ -n "$BASELINE" ]]; then
-	criterion_args=(--baseline "$BASELINE")
-elif [[ -n "$SAVE" ]]; then
-	criterion_args=(--save-baseline "$SAVE")
-else
-	criterion_args=(--save-baseline ref)
-fi
-
-if [[ "$BENCH" == "all" ]]; then
-	bench_targets=(speedup mean_latency tail_latency)
-else
-	bench_targets=("$BENCH")
-fi
-
-# Linux: use `taskset` to pin core and `setarch` to disable ASLR.
-pin_wrapper=()
-if ((IS_LINUX)) && [[ -n "${CORE:-}" ]]; then
-	pin_wrapper=(taskset -c "$CORE" setarch -R)
-fi
-
 # NUMA: bind memory to the node that owns the pinned core
 # so cache misses don't traverse the inter-socket interconnect.
 numa_wrapper=()
@@ -154,6 +132,12 @@ if ((IS_LINUX)) && command -v numactl >/dev/null 2>&1 && [[ -n "${CORE:-}" ]]; t
 			echo "info: NUMA pinning memory to node $numa_node" >&2
 		fi
 	fi
+fi
+
+# Linux: use `taskset` to pin core and `setarch` to disable ASLR.
+pin_wrapper=()
+if ((IS_LINUX)) && [[ -n "${CORE:-}" ]]; then
+	pin_wrapper=(taskset -c "$CORE" setarch -R)
 fi
 
 # As root: nice -n -20 (max CFS prio) + prlimit memlock (no page-out).
@@ -179,11 +163,30 @@ elif ((IS_LINUX)) && command -v chrt >/dev/null 2>&1; then
 	launcher=(chrt -b 0)
 fi
 
-# Strip a leading '--' from forwarded args so both `-- --flag` and `--flag` work.
+if [[ "$BENCH" == "all" ]]; then
+	bench_targets=(speedup mean_latency tail_latency)
+else
+	bench_targets=("$BENCH")
+fi
+echo "info: running benchmarks: ${bench_targets[*]}" >&2
+
+if [[ -n "$LOAD" ]]; then
+	criterion_args=(--load-baseline "$LOAD" --baseline "${BASELINE:-ref}")
+elif [[ -n "$BASELINE" ]]; then
+	criterion_args=(--baseline "$BASELINE")
+elif [[ -n "$SAVE" ]]; then
+	criterion_args=(--save-baseline "$SAVE")
+else
+	criterion_args=(--save-baseline ref)
+fi
+echo "info: Criterion args: ${criterion_args[*]}" >&2
+
+# Strip a leading '--' from forwarded args since we include it ourselves.
 forward_args=("$@")
 if [[ "${#forward_args[@]}" -gt 0 && "${forward_args[0]}" == "--" ]]; then
 	forward_args=("${forward_args[@]:1}")
 fi
+echo "info: forwarding args: ${forward_args[*]}" >&2
 
 for target in "${bench_targets[@]}"; do
 	cmd=("${numa_wrapper[@]}" "${pin_wrapper[@]}" cargo bench --bench "$target" -- "${criterion_args[@]}" "${forward_args[@]}")
