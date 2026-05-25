@@ -509,6 +509,15 @@ enum LookupStep {
     StopSearch,
 }
 
+/// Outcome of the level-walk on a miss.
+enum LevelMiss {
+    /// Probe chain terminated via a clean EMPTY byte — no TOMBSTONE seen,
+    /// so no overflow to special array possible.
+    ChainClean,
+    /// Loop exhausted; key may be in the special array.
+    MayContinue,
+}
+
 /// Candidate-tracking mode for `find_in_*` scans.
 ///
 /// - `Lookup`: pure lookup — skip the free-slot SIMD scan.
@@ -892,18 +901,26 @@ where
         // Scan levels: on match, replace; on miss, retain the first free
         // slot we saw as the insertion candidate.
         let mut candidate: Option<SlotLocation> = None;
-        if let Some(location) = self.find_in_levels(
+        let (found, miss) = self.find_in_levels(
             &key,
             key_hash,
             key_fingerprint,
             Candidate::Track(&mut candidate),
-        ) {
+        );
+        if let Some(location) = found {
             return Some(self.replace_existing_value(location, value));
         }
 
-        // Fast path: levels gave us a slot and the special array is empty,
-        // so primary/fallback can't hold the key — skip those scans.
-        if candidate.is_some() && self.special.total_len == 0 {
+        // Fast path: skip special-array dedup if either:
+        // (1) the level chain terminated via a clean EMPTY byte — no
+        //     TOMBSTONE seen, so the key cannot have overflowed to special;
+        // (2) special is entirely empty.
+        // Condition (1) checked first: it's a register value, avoiding the
+        // `total_len` memory load when the chain ended cleanly.
+        // Both cases require a level-side candidate to place the new entry.
+        if candidate.is_some()
+            && (matches!(miss, LevelMiss::ChainClean) || self.special.total_len == 0)
+        {
             return self.insert_at_location_after_resize_check(
                 candidate,
                 key_hash,
@@ -913,35 +930,12 @@ where
             );
         }
 
-        // Scan special primary, then (on Continue) fallback. Passing
-        // `Track(&mut candidate)` records the first free slot if we don't
-        // have one yet; if `candidate` is already `Some`, both scans act
-        // like `Lookup` and skip the free-slot SIMD work.
-        match self.find_in_special_primary(
-            key_hash,
-            key_fingerprint,
-            &key,
-            Candidate::Track(&mut candidate),
-        ) {
-            LookupStep::Found(slot_idx) => {
-                return Some(
-                    self.replace_existing_value(SlotLocation::SpecialPrimary { slot_idx }, value),
-                );
-            }
-            LookupStep::StopSearch => {}
-            LookupStep::Continue => {
-                if let Some(slot_idx) = self.find_in_special_fallback(
-                    key_hash,
-                    key_fingerprint,
-                    &key,
-                    Candidate::Track(&mut candidate),
-                ) {
-                    return Some(self.replace_existing_value(
-                        SlotLocation::SpecialFallback { slot_idx },
-                        value,
-                    ));
-                }
-            }
+        // Cold path: key might be in the special array. Outlined into its
+        // own function to keep insert's hot code compact.
+        if let Some(location) =
+            self.scan_special_for_key(&key, key_hash, key_fingerprint, &mut candidate)
+        {
+            return Some(self.replace_existing_value(location, value));
         }
 
         self.insert_at_location_after_resize_check(candidate, key_hash, key, value, key_fingerprint)
@@ -1656,9 +1650,9 @@ where
             .map(|slot_idx| SlotLocation::SpecialFallback { slot_idx })
     }
 
-    /// Paper §5: walk `A_1..A_α` in order, stopping on the first `StopSearch`.
-    /// `Candidate::Track` records the earliest level's free slot so inserts
-    /// spill into deeper bucket levels before reaching the special array.
+    /// Paper §5: walk `A_1..A_α` in order; record the first free slot via
+    /// `Candidate::Track`. Returns the key location if found, plus a
+    /// [`LevelMiss`] indicating whether a special-array scan is needed.
     #[inline]
     fn find_in_levels<Q>(
         &self,
@@ -1666,7 +1660,7 @@ where
         key_hash: u64,
         key_fingerprint: u8,
         candidate: Candidate<'_, SlotLocation>,
-    ) -> Option<SlotLocation>
+    ) -> (Option<SlotLocation>, LevelMiss)
     where
         K: Borrow<Q>,
         Q: Eq + ?Sized,
@@ -1691,17 +1685,62 @@ where
             }
             match lookup_step {
                 LookupStep::Found(slot_idx) => {
-                    return Some(SlotLocation::Level {
-                        level_idx,
-                        slot_idx,
-                    });
+                    return (
+                        Some(SlotLocation::Level {
+                            level_idx,
+                            slot_idx,
+                        }),
+                        LevelMiss::MayContinue,
+                    );
                 }
                 LookupStep::Continue => {}
-                LookupStep::StopSearch => break,
+                LookupStep::StopSearch => {
+                    candidate.record(local);
+                    return (None, LevelMiss::ChainClean);
+                }
             }
         }
 
         candidate.record(local);
+        (None, LevelMiss::MayContinue)
+    }
+
+    /// Probe special primary then fallback for `key`;
+    /// record first free slot in `candidate`.
+    #[cold]
+    #[inline(never)]
+    fn scan_special_for_key<Q>(
+        &self,
+        key: &Q,
+        key_hash: u64,
+        key_fingerprint: u8,
+        candidate: &mut Option<SlotLocation>,
+    ) -> Option<SlotLocation>
+    where
+        K: Borrow<Q>,
+        Q: Eq + ?Sized,
+    {
+        match self.find_in_special_primary(
+            key_hash,
+            key_fingerprint,
+            key,
+            Candidate::Track(candidate),
+        ) {
+            LookupStep::Found(slot_idx) => {
+                return Some(SlotLocation::SpecialPrimary { slot_idx });
+            }
+            LookupStep::StopSearch => {}
+            LookupStep::Continue => {
+                if let Some(slot_idx) = self.find_in_special_fallback(
+                    key_hash,
+                    key_fingerprint,
+                    key,
+                    Candidate::Track(candidate),
+                ) {
+                    return Some(SlotLocation::SpecialFallback { slot_idx });
+                }
+            }
+        }
         None
     }
 
