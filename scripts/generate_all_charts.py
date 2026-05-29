@@ -4,7 +4,7 @@ from generate_speedup_chart import plot_throughput_speedup
 from _plot_common import ASSETS_DIR
 
 
-def main() -> None:
+def main():
     plot_throughput_speedup(ASSETS_DIR)
     plot_mean_latency_by_size(ASSETS_DIR)
     plot_tail_cdf(ASSETS_DIR)

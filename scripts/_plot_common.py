@@ -59,7 +59,7 @@ def apply_axis_style(
     xlabel: str,
     ylabel: str,
     y_formatter=None,
-) -> None:
+):
     ax.tick_params(axis="y", labelsize=11, length=0)
     ax.tick_params(axis="x", length=0)
     if y_formatter is not None:
@@ -80,7 +80,7 @@ def apply_axis_style(
         )
 
 
-def save_svg(fig, path: Path) -> None:
+def save_svg(fig, path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, format="svg", bbox_inches="tight")
     plt.close(fig)

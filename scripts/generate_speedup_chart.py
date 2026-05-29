@@ -24,7 +24,7 @@ THROUGHPUT_WORKLOADS = (
 )
 
 
-def plot_throughput_speedup(assets_dir: Path) -> None:
+def plot_throughput_speedup(assets_dir: Path):
     """Single bar chart: all throughput workloads, speedup vs std."""
     labels = []
     elastic_speedups = []
@@ -100,7 +100,7 @@ def plot_throughput_speedup(assets_dir: Path) -> None:
     save_svg(fig, assets_dir / "benchmark-speedup.svg")
 
 
-def main() -> None:
+def main():
     plot_throughput_speedup(ASSETS_DIR)
 
 

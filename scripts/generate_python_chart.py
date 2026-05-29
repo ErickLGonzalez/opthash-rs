@@ -50,7 +50,7 @@ def load_means(path: Path) -> dict[str, dict[str, float]]:
     return out
 
 
-def plot_speedup(means: dict[str, dict[str, float]], assets_dir: Path) -> None:
+def plot_speedup(means: dict[str, dict[str, float]], assets_dir: Path):
     labels: list[str] = []
     elastic_speedups: list[float] = []
     funnel_speedups: list[float] = []
@@ -110,7 +110,7 @@ def plot_speedup(means: dict[str, dict[str, float]], assets_dir: Path) -> None:
     save_svg(fig, assets_dir / "benchmark-python-speedup.svg")
 
 
-def plot_python_speedup(assets_dir: Path) -> None:
+def plot_python_speedup(assets_dir: Path):
     if not BENCHMARKS_JSON.exists():
         rel = BENCHMARKS_JSON.relative_to(ROOT)
         print(f"skipped python chart: {rel} not found")
@@ -119,7 +119,7 @@ def plot_python_speedup(assets_dir: Path) -> None:
     plot_speedup(load_means(BENCHMARKS_JSON), assets_dir)
 
 
-def main() -> None:
+def main():
     plot_python_speedup(ASSETS_DIR)
 
 

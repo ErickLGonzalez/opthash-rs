@@ -20,7 +20,7 @@ from _plot_common import (
 TAIL_SIZE = 10_000_000
 
 
-def plot_mean_latency_by_size(assets_dir: Path) -> None:
+def plot_mean_latency_by_size(assets_dir: Path):
     """Criterion-mean per-lookup latency vs map size. Linear y, categorical x.
 
     Cache-hierarchy cliffs (L1→L2→L3→DRAM) appear as visible jumps; absolute
@@ -93,7 +93,7 @@ def _tail_x(q):
     return 1.0 / np.maximum(1.0 - np.asarray(q, dtype=float), 1e-7)
 
 
-def plot_tail_cdf(assets_dir: Path) -> None:
+def plot_tail_cdf(assets_dir: Path):
     """Percentile-vs-latency tail plot for get-hit @ TAIL_SIZE, one line per impl."""
     fig, ax = plt.subplots(figsize=(10, 6), constrained_layout=True)
     max_x = _tail_x(TAIL_TICK_QS[-1])
@@ -147,7 +147,7 @@ def plot_tail_cdf(assets_dir: Path) -> None:
     save_svg(fig, assets_dir / "latency-tail-10M-get-hit.svg")
 
 
-def main() -> None:
+def main():
     plot_mean_latency_by_size(ASSETS_DIR)
     plot_tail_cdf(ASSETS_DIR)
 
