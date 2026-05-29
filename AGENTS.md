@@ -1,17 +1,17 @@
 # AGENTS.md
 
-Run all of these after every refactor. Check benchmark results in `target/criterion/` for performance regressions.
+Use this file as the local operating guide for code changes in this repo.
 
 ## Commands
 
+For code refactors, run:
+
 ```bash
-cargo fmt                                   # Format Rust code
-cargo clippy --all-targets --features python -- -W clippy::pedantic   # Lint with pedantic warnings
 cargo test                                  # Run all tests
-scripts/bench.sh                            # Run all benchmarks (noise-controlled — see Benchmarks)
-uvx ruff format                             # Format Python code (scripts/, tests/)
-pre-commit run --all-files                  # Run formatters on the whole tree
+pre-commit run --all-files                  # Runs formatters, clippy, ruff, mypy stub checks
 ```
+
+For performance-sensitive changes, run the relevant benchmark A/B workflow in [Benchmarks](#benchmarks) and read the JSON results.
 
 One-time setup (after cloning):
 
@@ -24,34 +24,37 @@ pre-commit install
 
 Criterion suite comparing `ElasticHashMap`, `FunnelHashMap`, `std::HashMap`, `hashbrown::HashMap` (SwissTable + foldhash — absolute ceiling).
 
-**Always use `scripts/bench.sh` for results you'll act on.** Raw `cargo bench` is unpinned — wall-clock noise can swing ±10% and flip the sign of real ±5% changes. Use raw cargo only for smoke runs / single-filter iteration.
+Use `scripts/bench.sh` for benchmark results you will act on. Raw `cargo bench` is unpinned; wall-clock noise can swing ±10% and flip the sign of real ±5% changes. Use raw cargo only for smoke runs or single-filter iteration.
+
+For A/B comparisons, save a known anchor, save each changed tree as a named variant, then compare stored runs offline with `LOAD` and `BASELINE`. Refresh `ref` when intentionally updating the default anchor after environment or benchmark-fixture changes.
 
 ```bash
-scripts/bench.sh                            # measure + save as "ref"
-SAVE=opt1 scripts/bench.sh                  # measure + save as "opt1"
-LOAD=opt1 scripts/bench.sh                  # opt1 vs ref (no rerun)
-LOAD=opt1 BASELINE=opt2 scripts/bench.sh    # opt1 vs opt2 (no rerun)
+SAVE=anchor scripts/bench.sh                # measure known baseline
+SAVE=opt1 scripts/bench.sh                  # measure changed tree
+LOAD=opt1 BASELINE=anchor scripts/bench.sh  # opt1 vs anchor (no rerun)
+SAVE=ref scripts/bench.sh                   # intentionally refresh the default anchor
 ```
 
-For A/B many optimizations against the same anchor: `SAVE=optN` each variant, then `LOAD=optN` to compare offline. Stored baselines persist in `target/criterion/`.
+For many variants against the same anchor, save the anchor once (`SAVE=anchor`), save each variant (`SAVE=optN`), then compare with `LOAD=optN BASELINE=anchor`. Stored baselines persist in `target/criterion/`.
 
-- Wraps `cargo bench` with `taskset` (core pin), `setarch -R` (ASLR off), `chrt -b` (scheduler batch), and `numactl` (NUMA bind, multi-node only) — no privileges. `sudo` adds `nice -20`, `prlimit` memlock; drops back to invoking user for cargo.
-- `BENCH=all` (default) runs `speedup` then `latency`; set `BENCH=speedup|latency` for single-target.
-- Re-save `ref` when env changes (sudo vs not, core pin) — baselines are wall-clock.
-- Pass through flags with `--` separator: `SAVE=ref scripts/bench.sh -- --measurement-time 10`. Criterion name filter: `scripts/bench.sh -- "get_hit_latency"`. Both forms accepted (script strips the leading `--`).
-- `latency` bench writes histograms to `target/latency/` and ignores `--baseline`.
-
-**Read results from JSON, not stdout** (stdout truncates + mixes runs):
+Read results from JSON, not stdout. Stdout truncates and mixes runs.
 
 - `target/criterion/<group>/<variant>/new/estimates.json` — absolute ns (`mean.point_estimate`)
-- `target/criterion/<group>/<variant>/change/estimates.json` — fractional change vs the baseline this run compared against (e.g. +0.05 = 5% slower)
+- `target/criterion/<group>/<variant>/change/estimates.json` — fractional change vs the selected baseline (`+0.05` = 5% slower)
+- Variants are `<op>_<impl>` per [benches/speedup.rs](benches/speedup.rs), for example `get_hit_funnel` or `insert_elastic`.
+- Example change file: `target/criterion/get_hit_throughput/get_hit_funnel/change/estimates.json`.
 
-Variants are `<op>_<impl>` per [benches/speedup.rs](benches/speedup.rs) (e.g. `get_hit_funnel`, `insert_elastic`). Example: `target/criterion/get_hit_throughput/get_hit_funnel/change/estimates.json`.
+Run shape and options:
+
+- Wraps `cargo bench` with `taskset` (core pin), `setarch -R` (ASLR off), `chrt -b` (scheduler batch), and `numactl` (NUMA bind, multi-node only) — no privileges. `sudo` adds `nice -20`, `prlimit` memlock; drops back to invoking user for cargo.
+- `BENCH=all` (default) runs `speedup`, `mean_latency`, then `tail_latency`; set `BENCH=speedup|mean_latency|tail_latency` for one target.
+- Pass through Criterion flags with `--`: `SAVE=opt1 scripts/bench.sh -- --measurement-time 10`.
+- Filter by Criterion name: `SAVE=opt1 scripts/bench.sh -- "get_hit_latency"`. The script strips a leading `--`, so both forms work.
 
 ### Latency-chart harnesses
 
-- **`cargo bench --bench mean_latency`** — Criterion sweep of `get_hit` over `LATENCY_SIZES` (1K → 10M); feeds the cache-cliff line chart. Output: `target/criterion/get_hit_latency_<size>/<impl>/`.
-- **`cargo bench --bench tail_latency`** — HDR get-hit distribution at SIZE=10M (1M samples × 4 maps × 10K warmup). Output: `target/latency/<map>/<size>/<op>.json` (serde_json) — percentiles + histogram buckets + `clock_overhead_ns`.
+- `BENCH=mean_latency scripts/bench.sh` — Criterion sweep of `get_hit` over `LATENCY_SIZES` (1K → 10M); feeds the cache-cliff line chart. Output: `target/criterion/get_hit_latency_<size>/<impl>/`.
+- `BENCH=tail_latency scripts/bench.sh` — HDR get-hit distribution at SIZE=10M (1M samples × 4 maps × 10K warmup). Output: `target/latency/<map>/<size>/<op>.json` (serde_json) — percentiles + histogram buckets + `clock_overhead_ns`. This harness writes JSON directly and does not use Criterion baselines.
 
 ### Python-side benchmarks
 
@@ -79,7 +82,7 @@ uv run scripts/generate_python_chart.py
 - `uv run scripts/generate_all_charts.py` — regenerate everything
 - `uv run scripts/generate_python_chart.py` — Python-side dict-vs-opthash speedup (reads `.benchmarks/python.json`)
 
-Charts are saved in `assets/`. Shared plotting helpers (`IMPLEMENTATIONS`, loaders, axis styling) live in `scripts/plot_common.py`. The tail plotter subtracts `clock_overhead_ns` so percentiles reflect per-op latency, not per-(op + `Instant::now()`).
+Charts are saved in `assets/`. Shared plotting helpers (`IMPLEMENTATIONS`, loaders, axis styling) live in `scripts/_plot_common.py`. The tail plotter subtracts `clock_overhead_ns` so percentiles reflect per-op latency, not per-(op + `Instant::now()`).
 
 ## Project structure
 
@@ -107,11 +110,12 @@ When spawning a worktree, name its branch after the work (e.g. `feat/std-parity-
 ### Reject
 
 - Metadata that costs work on every insert/delete unless benchmarks prove a net win.
-- Optimizations that improve a microbenchmark but regress the public `throughput` suite. `target/criterion/` is the final gate — if the relevant benchmark regresses, the change does not stay.
+- Optimizations that improve a narrow microbenchmark but regress the public `speedup` suite. `target/criterion/` is the final gate — if the relevant benchmark regresses, the change does not stay.
 
 ### Bench methodology
 
-- Re-save `ref` whenever a fixture constant changes (`HIT_LOOKUP_COUNT`, `MIXED_OP_COUNT`, etc.). Comparing across different workloads makes the `change/` deltas meaningless.
+- Re-save the anchor whenever a fixture constant changes (`OP_COUNT`, `MAP_SIZE`, `LATENCY_SIZES`, etc.). Comparing across different workloads makes `change/` deltas meaningless.
+- Treat unchanged controls (`std`, `hashbrown`) as the run's noise floor. Large movement in controls weakens any conclusion about `elastic` or `funnel`.
 - Rebuild before reading callgrind output. Stale binaries silently report pre-change asm — check binary mtime against the commit you intend to measure.
 
 ### Verify before refactor
