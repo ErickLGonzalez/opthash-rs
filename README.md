@@ -14,10 +14,10 @@ Both are open-addressing hash maps that achieve optimal expected probe complexit
 
 ## Data Structures
 
-Both maps share a common core: a single-`Arena` allocation per map indexed by per-level descriptors, 7-bit fingerprint control bytes, SIMD control-byte scans for occupancy + lookup, tombstone accounting, and SwissTable-style triangular probing within every level [^swisstable] [^cppcon2017] [^hashbrown]. Per-level salt re-randomization [^cw1979] decorrelates probe paths across levels. The default `BuildHasher` is [`foldhash`](https://crates.io/crates/foldhash) [^foldhash].
+Both maps share a common core: a single-`Arena` allocation per map indexed by per-level descriptors, 7-bit fingerprint control bytes, SIMD control-byte scans for occupancy + lookup, and tombstone accounting [^swisstable] [^cppcon2017] [^hashbrown]. Per-level salt re-randomization [^cw1979] decorrelates probe paths across levels. The default `BuildHasher` is [`foldhash`](https://crates.io/crates/foldhash) [^foldhash]. The two maps differ in how they probe within a level:
 
-- **`ElasticHashMap<K, V>`** — Flat group-probed level with geometrically halving capacities; insertion uses per-level probe budgets.
-- **`FunnelHashMap<K, V>`** — Bucketed levels plus a split special array: `primary` (group-probed) and `fallback` (two-choice buckets).
+- **`ElasticHashMap<K, V>`** — Levels with geometrically halving capacities, each probed by a SwissTable-style triangular sequence (`(idx + delta) & mask`); inserts follow a per-level probe budget.
+- **`FunnelHashMap<K, V>`** — Bucketed levels (paper §5): a key maps to one bucket per level; overflow spills to the next level, not other buckets. Plus a split special array: `primary` (odd-step group probe) and `fallback` (two-choice buckets).
 
 Both maps mirror `std::collections::HashMap`'s API and support the same operations. Each map starts with zero allocation (`new()`) and grows dynamically on demand. The `reserve_fraction` headroom knob is exposed via dedicated constructors.
 
@@ -151,5 +151,3 @@ See [benches/README.md](benches/README.md) for comparison charts.
 [^hashbrown]: `hashbrown` — Rust port of SwissTable. <https://github.com/rust-lang/hashbrown>. Used as the absolute throughput ceiling in the Criterion benches (see [benches/README.md](benches/README.md)).
 
 [^foldhash]: `foldhash` crate. <https://crates.io/crates/foldhash>. Default `BuildHasher` (`foldhash::fast::RandomState`) wired up in [`src/common/mod.rs`](https://github.com/aaron-ang/opthash-rs/blob/main/src/common/mod.rs).
-
-[^prefetch2007]: Shimin Chen, Anastassia Ailamaki, Phillip B. Gibbons, Todd C. Mowry. _Improving Hash Join Performance through Prefetching_ (ACM TODS 2007). PDF: <https://www.cs.cmu.edu/~chensm/papers/hashjoin_tods_preliminary.pdf>. Motivates the intra-probe issued one group ahead (see [`src/funnel.rs`](https://github.com/aaron-ang/opthash-rs/blob/main/src/funnel.rs)).
