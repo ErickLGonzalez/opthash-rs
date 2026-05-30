@@ -13,6 +13,7 @@ pub use equivalent::Equivalent;
 
 pub use common::DefaultHashBuilder;
 pub use common::error::TryReserveError;
+
 pub use elastic::{
     Drain as ElasticDrain, ElasticHashMap, ElasticIntoIter, ElasticIntoKeys, ElasticIntoValues,
     ElasticIter, ElasticIterMut, ElasticValuesMut, ExtractIf as ElasticExtractIf,
@@ -23,10 +24,7 @@ pub use funnel::{
     FunnelIntoKeys, FunnelIntoValues, FunnelIter, FunnelIterMut, FunnelValuesMut,
     Keys as FunnelKeys, OccupiedError as FunnelOccupiedError, Values as FunnelValues,
 };
-// The entry types are the generic shell's enum/structs (the backend-side names
-// are thin aliases). Re-exporting the real enum keeps
-// `use ElasticEntry::{Occupied, Vacant}` / `use FunnelEntry::{Occupied, Vacant}`
-// working, which a bare alias forbids.
+
 pub use map::{
     Entry as ElasticEntry, Entry as FunnelEntry, OccupiedEntry as ElasticOccupiedEntry,
     OccupiedEntry as FunnelOccupiedEntry, VacantEntry as ElasticVacantEntry,

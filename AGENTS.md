@@ -47,14 +47,13 @@ Read results from JSON, not stdout. Stdout truncates and mixes runs.
 Run shape and options:
 
 - Wraps `cargo bench` with `taskset` (core pin), `setarch -R` (ASLR off), `chrt -b` (scheduler batch), and `numactl` (NUMA bind, multi-node only) — no privileges. `sudo` adds `nice -20`, `prlimit` memlock; drops back to invoking user for cargo.
-- `BENCH=all` (default) runs `speedup`, `mean_latency`, then `tail_latency`; set `BENCH=speedup|mean_latency|tail_latency` for one target.
+- `BENCH=all` (default) runs `speedup`, then `mean_latency`; set `BENCH=speedup|mean_latency` for one target.
 - Pass through Criterion flags with `--`: `SAVE=opt1 scripts/bench.sh -- --measurement-time 10`.
 - Filter by Criterion name: `SAVE=opt1 scripts/bench.sh -- "get_hit_latency"`. The script strips a leading `--`, so both forms work.
 
-### Latency-chart harnesses
+### Latency-chart harness
 
 - `BENCH=mean_latency scripts/bench.sh` — Criterion sweep of `get_hit` over `LATENCY_SIZES` (1K → 10M); feeds the cache-cliff line chart. Output: `target/criterion/get_hit_latency_<size>/get_hit_latency_<size>_<impl>/`.
-- `BENCH=tail_latency scripts/bench.sh` — HDR get_hit distribution at SIZE=10M (1M samples × 4 maps × 10K warmup). Output: `target/latency/<map>/<size>/<op>.json` (serde_json) — percentiles + histogram buckets + `clock_overhead_ns`. This harness writes JSON directly and does not use Criterion baselines.
 
 ### Python-side benchmarks
 
@@ -73,16 +72,16 @@ uv run scripts/generate_python_chart.py
 - **rust** — `cargo codspeed run --bench speedup`. The `criterion` dev-dep is a package rename to `codspeed-criterion-compat`; don't revert.
 - **python** — `pytest benches/python/throughput.py --codspeed`. `pytest-codspeed` is drop-in for `pytest-benchmark`.
 
-`mean_latency.rs` and `tail_latency.rs` are local-only. Sim counts instructions, not wallclock — `scripts/bench.sh` stays the local ground truth.
+`mean_latency.rs` is local-only. Sim counts instructions, not wallclock — `scripts/bench.sh` stays the local ground truth.
 
 ### Charts
 
 - `uv run scripts/generate_speedup_chart.py` — throughput speedup bar chart
-- `uv run scripts/generate_latency_chart.py` — Criterion mean-latency line (`target/criterion/get_hit_latency_<size>`; sizes from `LATENCY_SIZES` in `benches/common.rs`) + HDR get_hit tail CDF @ 10M (`target/latency/`).
+- `uv run scripts/generate_latency_chart.py` — Criterion mean-latency line (`target/criterion/get_hit_latency_<size>`; sizes from `LATENCY_SIZES` in `benches/common.rs`).
 - `uv run scripts/generate_all_charts.py` — regenerate everything
 - `uv run scripts/generate_python_chart.py` — Python-side dict-vs-opthash speedup (reads `.benchmarks/python.json`)
 
-Charts are saved in `assets/`. Shared plotting helpers (`IMPLEMENTATIONS`, loaders, axis styling) live in `scripts/_plot_common.py`. The tail plotter subtracts `clock_overhead_ns` so percentiles reflect per-op latency, not per-(op + `Instant::now()`).
+Charts are saved in `assets/`. Shared plotting helpers (`IMPLEMENTATIONS`, loaders, axis styling) live in `scripts/_plot_common.py`.
 
 ## Project structure
 

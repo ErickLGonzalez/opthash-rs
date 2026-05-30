@@ -10,7 +10,6 @@ from matplotlib.ticker import FuncFormatter
 
 ROOT = Path(__file__).resolve().parents[1]
 CRITERION_DIR = ROOT / "target" / "criterion"
-LATENCY_DIR = ROOT / "target" / "latency"
 ASSETS_DIR = ROOT / "assets"
 
 IMPLEMENTATIONS = ("std", "hashbrown", "elastic", "funnel")
@@ -42,13 +41,6 @@ def load_criterion_mean_ns(group: str, variant: str) -> float:
     if "mean" in data and "point_estimate" in data["mean"]:
         return float(data["mean"]["point_estimate"])
     raise RuntimeError(f"no usable mean point estimate in {path}")
-
-
-def load_latency_json(implementation: str, size: int, op: str) -> dict | None:
-    path = LATENCY_DIR / implementation / str(size) / f"{op}.json"
-    if not path.exists():
-        return None
-    return json.loads(path.read_text())
 
 
 def apply_axis_style(

@@ -53,7 +53,3 @@ harness = false
 [[bench]]
 name = "mean_latency"
 harness = false
-
-[[bench]]
-name = "tail_latency"
-harness = false

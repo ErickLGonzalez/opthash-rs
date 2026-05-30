@@ -2,7 +2,6 @@ from pathlib import Path
 
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.ticker import LogFormatterMathtext, LogLocator, NullLocator
 
 from _plot_common import (
     ASSETS_DIR,
@@ -12,12 +11,8 @@ from _plot_common import (
     LATENCY_SIZES,
     apply_axis_style,
     load_criterion_mean_ns,
-    load_latency_json,
     save_svg,
 )
-
-# Size (entries) at which `benches/latency.rs` records tail histograms.
-TAIL_SIZE = 10_000_000
 
 
 def plot_mean_latency_by_size(assets_dir: Path):
@@ -72,86 +67,8 @@ def plot_mean_latency_by_size(assets_dir: Path):
     save_svg(fig, assets_dir / "benchmark-latency.svg")
 
 
-def _percentile_curve(
-    buckets: list[dict], overhead_ns: float = 0.0
-) -> tuple[np.ndarray, np.ndarray]:
-    """Return (quantile, latency_ns) from sorted-by-ns_high bucket list."""
-    highs = np.array([b["ns_high"] for b in buckets], dtype=float)
-    highs = np.maximum(highs - overhead_ns, 1.0)
-    counts = np.array([b["count"] for b in buckets], dtype=float)
-    total = counts.sum()
-    if total == 0:
-        return np.array([]), np.array([])
-    cum_q = np.cumsum(counts) / total
-    return cum_q, highs
-
-
-TAIL_TICK_QS = (0.0, 0.5, 0.9, 0.99, 0.999, 0.9999, 0.99999)
-TAIL_TICK_LABELS = ("p0", "p50", "p90", "p99", "p99.9", "p99.99", "p99.999")
-
-
-def _tail_x(q):
-    """Map quantile q in [0, 1) onto a log-scaled tail axis: x = 1 / (1 - q)."""
-    return 1.0 / np.maximum(1.0 - np.asarray(q, dtype=float), 1e-7)
-
-
-def plot_tail_cdf(assets_dir: Path):
-    """Percentile-vs-latency tail plot for get_hit @ TAIL_SIZE, one line per impl."""
-    fig, ax = plt.subplots(figsize=(10, 6), constrained_layout=True)
-    max_x = _tail_x(TAIL_TICK_QS[-1])
-
-    any_data = False
-    for impl in IMPLEMENTATIONS:
-        doc = load_latency_json(impl, TAIL_SIZE, "get_hit")
-        if doc is None:
-            continue
-        buckets = doc.get("histogram", [])
-        if not buckets:
-            continue
-        overhead = float(doc.get("clock_overhead_ns", 0))
-        q, y = _percentile_curve(buckets, overhead)
-        if q.size == 0:
-            continue
-        any_data = True
-        x = _tail_x(q)
-        ax.plot(
-            x,
-            y,
-            color=IMPL_COLORS[impl],
-            linewidth=2,
-            label=IMPL_LABELS[impl],
-        )
-
-    if not any_data:
-        plt.close(fig)
-        print(f"no latency data for get_hit @ {TAIL_SIZE}, skipping tail plot")
-        return
-
-    tick_positions = [_tail_x(q) for q in TAIL_TICK_QS]
-    ax.set_xscale("log")
-    ax.set_yscale("log")
-    ax.set_xticks(tick_positions)
-    ax.set_xticklabels(TAIL_TICK_LABELS, fontsize=12)
-    ax.set_xlim(1.0, max_x * 1.3)
-    ax.xaxis.set_minor_locator(NullLocator())
-    ax.yaxis.set_major_locator(LogLocator(base=10.0))
-    ax.yaxis.set_minor_locator(NullLocator())
-    ax.yaxis.set_major_formatter(LogFormatterMathtext(base=10.0))
-    apply_axis_style(
-        ax,
-        title=f"Tail Latency — Get Hit @ {TAIL_SIZE // 1_000_000}M entries",
-        subtitle="Latency at percentile p (log axes) — lower is better",
-        xlabel="Percentile",
-        ylabel="Latency (ns, log scale)",
-    )
-    ax.legend(fontsize=12, loc="upper left")
-
-    save_svg(fig, assets_dir / "latency-tail-10M-get_hit.svg")
-
-
 def main():
     plot_mean_latency_by_size(ASSETS_DIR)
-    plot_tail_cdf(ASSETS_DIR)
 
 
 if __name__ == "__main__":

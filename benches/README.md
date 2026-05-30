@@ -25,11 +25,9 @@ For the CodSpeed-tracked suite (`speedup.rs`):
   [generate_speedup_chart.py](../scripts/generate_speedup_chart.py) and keep
   `IMPLEMENTATIONS` in [_plot_common.py](../scripts/_plot_common.py) in sync.
 
-Local-only suites (`mean_latency.rs`, `tail_latency.rs`) aren't uploaded to
-CodSpeed but use the same tokens: `mean_latency` emits `get_hit_latency_<size>_<impl>`
-Criterion ids; `tail_latency` (not Criterion) writes
-`target/latency/<impl>/<size>/get_hit.json`. No CodSpeed history here, so
-renaming is free.
+The local-only `mean_latency.rs` suite isn't uploaded to CodSpeed but uses the
+same tokens: it emits `get_hit_latency_<size>_<impl>` Criterion ids. No CodSpeed
+history here, so renaming is free.
 
 ## Throughput (Rust, vs `std::HashMap`)
 
@@ -38,10 +36,6 @@ renaming is free.
 ## Mean latency by map size (Rust)
 
 ![Latency chart](../assets/benchmark-latency.svg)
-
-## Tail latency distribution (Rust)
-
-![Tail latency — get_hit @ 10M](../assets/latency-tail-10M-get_hit.svg)
 
 ## Python bindings vs builtin `dict`
 

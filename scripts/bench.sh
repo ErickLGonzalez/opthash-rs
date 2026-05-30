@@ -164,7 +164,7 @@ elif ((IS_LINUX)) && command -v chrt >/dev/null 2>&1; then
 fi
 
 if [[ "$BENCH" == "all" ]]; then
-	bench_targets=(speedup mean_latency tail_latency)
+	bench_targets=(speedup mean_latency)
 else
 	bench_targets=("$BENCH")
 fi
