@@ -33,6 +33,9 @@ struct Level<T> {
     group_count: u32,
     /// `group_count - 1`; pow2 so probe wrap is `& mask`.
     group_count_mask: u32,
+    /// `1 +` the largest probe distance any live key needed (high-water).
+    /// Bounds the lookup scan; only grows until a resize resets it.
+    max_probe_groups: u32,
     /// Live entry count.
     len: u32,
     /// Deleted-slot count.
@@ -81,6 +84,7 @@ impl<T> Level<T> {
             capacity: cap_u32,
             group_count: gc,
             group_count_mask: gc.wrapping_sub(1),
+            max_probe_groups: 0,
             salt: math::level_salt(level_idx),
             len: 0,
             tombstones: 0,
@@ -136,11 +140,29 @@ impl<T> Level<T> {
         let mixed = key_hash ^ self.salt;
         probe::hash_to_usize(mixed) & self.group_count_mask as usize
     }
+
+    /// Extends `max_probe_groups` to cover `slot_idx`'s probe distance. Run on
+    /// every insert so a bounded lookup never stops short of a live key.
+    #[inline]
+    fn note_placement(&mut self, key_hash: u64, slot_idx: usize) {
+        let target_group = slot_idx / GROUP_SIZE;
+        let mask = self.group_count_mask as usize;
+        let mut probe = probe::TriangularProbe::new(self.triangular_group_start(key_hash));
+        let mut steps = 0u32;
+        while probe.pos != target_group {
+            probe.advance(mask);
+            steps += 1;
+        }
+        if steps + 1 > self.max_probe_groups {
+            self.max_probe_groups = steps + 1;
+        }
+    }
 }
 
 impl<K, V> Level<SlotEntry<K, V>> {
-    /// Triangular probe: fingerprint scan + key compare. Returns slot
-    /// index on hit, `None` on miss (stops at first EMPTY byte).
+    /// Triangular probe: fingerprint scan + key compare. Returns the slot on a
+    /// hit, `None` on a miss. Scans at most `max_probe_groups` groups — every
+    /// live key sits within that distance — or stops earlier at an EMPTY byte.
     #[inline]
     fn find_by_probe<Q>(&self, key_hash: u64, key_fingerprint: u8, key: &Q) -> Option<usize>
     where
@@ -151,7 +173,7 @@ impl<K, V> Level<SlotEntry<K, V>> {
         }
         let mask = self.group_count_mask as usize;
         let mut probe = probe::TriangularProbe::new(self.triangular_group_start(key_hash));
-        for _ in 0..self.group_count {
+        for _ in 0..self.max_probe_groups as usize {
             let match_mask = self.group_match_mask(probe.pos, key_fingerprint);
             for relative_idx in match_mask {
                 let slot_idx = probe.pos * GROUP_SIZE + relative_idx;
@@ -517,6 +539,7 @@ where
         let level = &mut self.levels[level_idx];
         let prev_ctrl = level.control_at(slot_idx);
         level.write_with_control(slot_idx, SlotEntry { key, value }, key_fingerprint);
+        level.note_placement(key_hash, slot_idx);
         level.len += 1;
         if prev_ctrl == CTRL_TOMBSTONE {
             level.tombstones -= 1;
@@ -814,6 +837,7 @@ where
             );
             dst.len = src_lvl.len;
             dst.tombstones = src_lvl.tombstones;
+            dst.max_probe_groups = src_lvl.max_probe_groups;
         }
 
         // Success: extract arena + levels from the guard so its Drop becomes
@@ -892,6 +916,7 @@ where
 
         let level = &mut self.levels[level_idx];
         level.write_with_control(slot_idx, SlotEntry { key, value }, key_fingerprint);
+        level.note_placement(key_hash, slot_idx);
         level.len += 1;
         if level_idx > self.max_populated_level {
             self.max_populated_level = level_idx;
