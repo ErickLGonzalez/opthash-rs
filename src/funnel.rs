@@ -1671,7 +1671,10 @@ where
     where
         Q: Equivalent<K> + ?Sized,
     {
-        match self.levels[0].find_in_bucket(key_hash, key_fingerprint, key, None) {
+        // SAFETY: `levels.len() == level_count >= 1` (fixed at construction), so
+        // index 0 is always valid. Elides the hot-path bounds check + panic pad.
+        let level0 = unsafe { self.levels.get_unchecked(0) };
+        match level0.find_in_bucket(key_hash, key_fingerprint, key, None) {
             LookupStep::Found(slot_idx) => {
                 return Some(SlotLocation::Level {
                     level_idx: 0,
@@ -1684,7 +1687,11 @@ where
 
         if self.max_populated_level > 0 {
             let search_limit = (self.max_populated_level + 1).min(self.levels.len());
-            for (offset, level) in self.levels[1..search_limit].iter().enumerate() {
+            // SAFETY: `search_limit <= levels.len()` by the `min` above, and
+            // `1 <= search_limit` whenever `max_populated_level > 0`, so the
+            // range is in bounds. Elides the slice bounds check.
+            let tail = unsafe { self.levels.get_unchecked(1..search_limit) };
+            for (offset, level) in tail.iter().enumerate() {
                 match level.find_in_bucket(key_hash, key_fingerprint, key, None) {
                     LookupStep::Found(slot_idx) => {
                         return Some(SlotLocation::Level {
