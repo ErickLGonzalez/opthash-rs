@@ -1,6 +1,6 @@
 use std::hash::{BuildHasher, Hash};
 use std::mem;
-use std::ops::{ControlFlow, Range};
+use std::ops::Range;
 use std::slice;
 
 use allocator_api2::alloc::{Allocator, Global, Layout};
@@ -1682,47 +1682,27 @@ where
             LookupStep::StopSearch => return None,
         }
 
-        // L1+ is empty in steady state at default load; outline only when populated.
-        if self.max_populated_level > 0
-            && let ControlFlow::Break(result) =
-                self.find_in_higher_levels(key, key_hash, key_fingerprint)
-        {
-            return result;
+        if self.max_populated_level > 0 {
+            let search_limit = (self.max_populated_level + 1).min(self.levels.len());
+            for (offset, level) in self.levels[1..search_limit].iter().enumerate() {
+                match level.find_in_bucket(key_hash, key_fingerprint, key, None) {
+                    LookupStep::Found(slot_idx) => {
+                        return Some(SlotLocation::Level {
+                            level_idx: offset + 1,
+                            slot_idx,
+                        });
+                    }
+                    LookupStep::Continue => {}
+                    LookupStep::StopSearch => return None,
+                }
+            }
         }
 
-        // Special tables — only populated under overflow.
+        // Special tables are only populated under overflow.
         if self.special.total_len == 0 {
             return None;
         }
-
         self.find_in_special(key, key_hash, key_fingerprint, None)
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn find_in_higher_levels<Q>(
-        &self,
-        key: &Q,
-        key_hash: u64,
-        key_fingerprint: u8,
-    ) -> ControlFlow<Option<SlotLocation>>
-    where
-        Q: Equivalent<K> + ?Sized,
-    {
-        let search_limit = (self.max_populated_level + 1).min(self.levels.len());
-        for (offset, level) in self.levels[1..search_limit].iter().enumerate() {
-            match level.find_in_bucket(key_hash, key_fingerprint, key, None) {
-                LookupStep::Found(slot_idx) => {
-                    return ControlFlow::Break(Some(SlotLocation::Level {
-                        level_idx: offset + 1,
-                        slot_idx,
-                    }));
-                }
-                LookupStep::Continue => {}
-                LookupStep::StopSearch => return ControlFlow::Break(None),
-            }
-        }
-        ControlFlow::Continue(())
     }
 
     fn shrink_max_populated_level(&mut self) {
