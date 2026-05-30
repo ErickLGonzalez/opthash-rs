@@ -30,13 +30,20 @@ python = ["dep:pyo3"]
 nightly = ["allocator-api2/nightly", "hashbrown/nightly"]
 
 [dependencies]
-allocator-api2 = { version = "0.2", default-features = false, features = ["alloc"] }
+allocator-api2 = { version = "0.2", default-features = false, features = [
+    "alloc",
+] }
 equivalent = "1"
 foldhash = "0.2"
-pyo3 = { version = "0.28", features = ["extension-module", "abi3-py310"], optional = true }
+pyo3 = { version = "0.28", features = [
+    "extension-module",
+    "abi3-py310",
+], optional = true }
 
 [dev-dependencies]
-criterion = { package = "codspeed-criterion-compat", version = "4", features = ["html_reports"] }
+criterion = { package = "codspeed-criterion-compat", version = "4", features = [
+    "html_reports",
+] }
 hashbrown = "0.17"
 hdrhistogram = "7.5"
 pprof = { version = "0.15", features = ["flamegraph"] }
@@ -49,6 +56,23 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(codspeed)'] }
 [[bench]]
 name = "speedup"
 harness = false
+
+[[bench]]
+name = "load_factor"
+harness = false
+
+[[bench]]
+name = "map_api"
+harness = false
+
+[[bench]]
+name = "payload_size"
+harness = false
+
+[[bench]]
+name = "set_ops"
+harness = false
+
 
 [[bench]]
 name = "mean_latency"

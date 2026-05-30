@@ -9,7 +9,7 @@ use super::error::TryReserveError;
 use super::iter::RegionIter;
 use super::simd;
 
-/// Owns one zeroed allocation backing a map's ctrl bytes + slot data.
+/// Owns one allocation backing a map's ctrl bytes + slot data.
 /// No `Drop` impl — derived maps orchestrate teardown by calling
 /// [`ArenaSlots::drop_values`] on each descriptor before [`Arena::deallocate`].
 pub(crate) struct Arena {
