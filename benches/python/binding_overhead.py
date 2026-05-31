@@ -4,7 +4,7 @@ rows attributes ns cost to each step.
 
 For symbol-level attribution, drive under py-spy --native:
 
-    py-spy record --native --rate 1000 --duration 8 \\
+    uv run py-spy record --native --rate 1000 --duration 8 \\
       --format raw --output /tmp/perf_raw.txt -- \\
       python benches/python/binding_overhead.py
 """

@@ -34,11 +34,18 @@ Repository = "https://github.com/aaron-ang/opthash-rs"
 Issues = "https://github.com/aaron-ang/opthash-rs/issues"
 
 [dependency-groups]
-test = ["pytest>=8", "hypothesis>=6", "pytest-benchmark>=5", "pytest-codspeed>=4"]
-charts = ["matplotlib>=3.9"]
+dev = [
+    "hypothesis>=6",
+    "matplotlib>=3.9",
+    "pytest>=8",
+    "pytest-benchmark>=5",
+    "pytest-codspeed>=4",
+    "py-spy>=0.4.2",
+]
+
 
 [tool.uv]
-default-groups = ["test", "charts"]
+default-groups = ["dev"]
 
 [tool.maturin]
 features = ["python"]
