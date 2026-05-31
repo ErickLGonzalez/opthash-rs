@@ -85,7 +85,7 @@ impl<T> Level<T> {
             group_count: gc,
             group_count_mask: gc.wrapping_sub(1),
             max_probe_groups: 0,
-            salt: math::level_salt(level_idx),
+            salt: math::level_salt_wide(level_idx),
             len: 0,
             tombstones: 0,
             half_reserve_slot_threshold: u32::try_from(capacity::floor_half_reserve_slots(

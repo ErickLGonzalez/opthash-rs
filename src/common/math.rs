@@ -144,11 +144,22 @@ pub(crate) mod probe {
 
 /// Knuth multiplicative-hash constant (golden ratio * 2^64, odd).
 const GOLDEN_RATIO_U64: u64 = 0x9E37_79B9_7F4A_7C15;
+/// Low 32 bits of [`GOLDEN_RATIO_U64`].
+const GOLDEN_RATIO_U32: u32 = 0x7F4A_7C15;
 
 /// Per-level hash salt: mixes the level index into the hash to decorrelate
-/// bucket distributions across levels. Used by both elastic and funnel.
+/// bucket distributions across levels.
 #[inline]
-pub(crate) fn level_salt(level_idx: usize) -> u64 {
+#[allow(clippy::cast_possible_truncation)]
+pub(crate) fn level_salt(level_idx: usize) -> u32 {
+    // Level counts are tiny in practice; wrapping keeps the helper total for
+    // theoretical oversized descriptors.
+    GOLDEN_RATIO_U32.wrapping_mul((level_idx as u32).wrapping_add(1))
+}
+
+/// Wide per-level salt for code paths whose layout/codegen depends on `u64`.
+#[inline]
+pub(crate) fn level_salt_wide(level_idx: usize) -> u64 {
     // usize fits in u64 on every Rust target (max 64-bit pointer width).
     GOLDEN_RATIO_U64.wrapping_mul((level_idx as u64).wrapping_add(1))
 }

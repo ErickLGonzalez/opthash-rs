@@ -65,6 +65,33 @@ fn bench_tiny_lookup(c: &mut Criterion) {
     );
 }
 
+fn bench_mixed(c: &mut Criterion) {
+    let pairs = common::make_pairs(MAP_SIZE);
+    let ops: Vec<(usize, bool)> = (0..OP_COUNT)
+        .map(|i| {
+            let mixed = u32::try_from(i).unwrap().wrapping_mul(2_654_435_761);
+            let idx = mixed as usize % MAP_SIZE;
+            (idx, i & 1 == 0)
+        })
+        .collect();
+
+    let mut group = c.benchmark_group("mixed");
+    group.throughput(Throughput::Elements(OP_COUNT as u64));
+
+    bench_populated!(group, "mixed", BatchSize::LargeInput, &pairs, |map| {
+        for &(idx, is_read) in &ops {
+            let key = pairs[idx].0;
+            if is_read {
+                black_box(map.get(black_box(&key)));
+            } else {
+                black_box(map.insert(black_box(key), black_box(idx as u64)));
+            }
+        }
+    },);
+
+    group.finish();
+}
+
 fn bench_delete_heavy(c: &mut Criterion) {
     let initial_pairs = common::make_pairs(MAP_SIZE);
     let replacement_pairs: Vec<(u64, u64)> = (0..OP_COUNT)
@@ -90,33 +117,6 @@ fn bench_delete_heavy(c: &mut Criterion) {
             }
         },
     );
-
-    group.finish();
-}
-
-fn bench_mixed(c: &mut Criterion) {
-    let pairs = common::make_pairs(MAP_SIZE);
-    let ops: Vec<(usize, bool)> = (0..OP_COUNT)
-        .map(|i| {
-            let mixed = u32::try_from(i).unwrap().wrapping_mul(2_654_435_761);
-            let idx = mixed as usize % MAP_SIZE;
-            (idx, i & 1 == 0)
-        })
-        .collect();
-
-    let mut group = c.benchmark_group("mixed");
-    group.throughput(Throughput::Elements(OP_COUNT as u64));
-
-    bench_populated!(group, "mixed", BatchSize::LargeInput, &pairs, |map| {
-        for &(idx, is_read) in &ops {
-            let key = pairs[idx].0;
-            if is_read {
-                black_box(map.get(black_box(&key)));
-            } else {
-                black_box(map.insert(black_box(key), black_box(idx as u64)));
-            }
-        }
-    },);
 
     group.finish();
 }

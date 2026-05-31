@@ -30,7 +30,7 @@ struct BucketLevel<T> {
     capacity: u32,
     bucket_count_mask: u32,
     bucket_size_log2: u32,
-    salt: u64,
+    salt: u32,
     len: u32,
     tombstones: u32,
 }
@@ -77,8 +77,9 @@ impl<T> BucketLevel<T> {
     }
 
     #[inline]
+    #[allow(clippy::cast_possible_truncation)]
     fn bucket_index(&self, key_hash: u64) -> usize {
-        probe::hash_to_usize(key_hash ^ self.salt) & self.bucket_count_mask as usize
+        ((key_hash as u32) ^ self.salt) as usize & self.bucket_count_mask as usize
     }
 
     /// Slot index range covering all entries in `bucket_idx`.
