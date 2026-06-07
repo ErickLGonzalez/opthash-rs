@@ -40,12 +40,14 @@ For many variants against the same anchor, save the anchor once (`SAVE=anchor`),
 - `target/criterion/<group>/<variant>/new/estimates.json` — absolute ns (`mean.point_estimate`)
 - `target/criterion/<group>/<variant>/change/estimates.json` — fractional change vs the selected baseline (`+0.05` = 5% slower)
 - Variants are `<op>_<impl>` per [benches/speedup.rs](benches/speedup.rs), for example `get_hit_funnel` or `insert_elastic`.
-- Example change file: `target/criterion/get_hit_throughput/get_hit_funnel/change/estimates.json`.
+- Criterion group dir = `<workload>`; see [benches/README.md](benches/README.md) for the full id convention.
+- Example change file: `target/criterion/get_hit/get_hit_funnel/change/estimates.json`.
 
 Run shape and options:
 
 - Wraps `cargo bench` with `taskset` (core pin), `setarch -R` (ASLR off), `chrt -b` (scheduler batch), and `numactl` (NUMA bind, multi-node only) — no privileges. `sudo` adds `nice -20`, `prlimit` memlock; drops back to invoking user for cargo.
 - `BENCH=all` (default) runs `speedup`, then `mean_latency`; set `BENCH=speedup|mean_latency` for one target.
+- Other `[[bench]]` targets are not in `all`; run explicitly via `BENCH=<name>`: `set_ops` (set algebra), `map_api` (entry/iter/drain/extract_if), `load_factor`, `payload_size`.
 - Pass through Criterion flags with `--`: `SAVE=opt1 scripts/bench.sh -- --measurement-time 10`.
 - Filter by Criterion name: `SAVE=opt1 scripts/bench.sh -- "get_hit_latency"`. The script strips a leading `--`, so both forms work.
 
@@ -89,10 +91,13 @@ Charts are saved in `assets/`. Shared plotting helpers (`IMPLEMENTATIONS`, loade
 
 ## Project Structure
 
-- `src/elastic.rs` — `ElasticHashMap` (tests inline)
-- `src/funnel.rs` — `FunnelHashMap` (tests inline)
-- `src/common/` — shared internals used by library and benches: control-byte SIMD, bitmask, layout math, config
-- `benches/common.rs` — bench fixtures
+- `src/map.rs` — generic `HashMap<K, V, R>` public shell + `RawTable<K, V>` backend trait; both maps share it
+- `src/elastic.rs` — `ElasticTable: RawTable` + `ElasticHashMap` shell alias (tests inline)
+- `src/funnel.rs` — `FunnelTable: RawTable` + `FunnelHashMap` shell alias (tests inline)
+- `src/set.rs` — `ElasticHashSet`/`FunnelHashSet` wrapping the maps; set algebra
+- `src/python.rs` — pyo3 bindings, `#[cfg(feature = "python")]`
+- `src/common/` — shared internals (library + benches): `arena` (slot storage), control-byte SIMD, bitmask, layout math, config, error
+- `benches/common.rs` — bench fixtures; `benches/support/` — shared throughput harness
 
 Don't duplicate primitives across `src/` and `benches/`.
 
