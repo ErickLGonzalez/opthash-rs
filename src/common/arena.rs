@@ -1,4 +1,5 @@
-use std::mem::MaybeUninit;
+use std::marker::PhantomData;
+use std::mem::{self, MaybeUninit};
 use std::ptr;
 
 use allocator_api2::alloc::{Allocator, Layout};
@@ -80,6 +81,68 @@ pub(crate) fn layout_for<K, V>(total_ctrl: usize) -> Result<(Layout, usize), Try
         .extend(data_layout)
         .map_err(|_| TryReserveError::AllocError)?;
     Ok((arena_layout.pad_to_align(), data_base_off))
+}
+
+/// Hands out each arena region's `(ctrl_ptr, data_ptr)` in layout order,
+/// advancing the ctrl + data offsets with checked arithmetic — a `u32`
+/// overflow yields `CapacityOverflow`, never a wrapped pointer.
+pub(crate) struct LayoutCursor<T> {
+    base: *mut u8,
+    ctrl_off: u32,
+    data_off: u32,
+    slot_size: u32,
+    _marker: PhantomData<fn() -> T>,
+}
+
+impl<T> LayoutCursor<T> {
+    /// `data_base_off` is the data section's byte offset (from [`layout_for`]).
+    pub(crate) fn new(base: *mut u8, data_base_off: usize) -> Result<Self, TryReserveError> {
+        Ok(Self {
+            base,
+            ctrl_off: 0,
+            data_off: u32::try_from(data_base_off)
+                .map_err(|_| TryReserveError::CapacityOverflow)?,
+            slot_size: u32::try_from(mem::size_of::<T>())
+                .map_err(|_| TryReserveError::CapacityOverflow)?,
+            _marker: PhantomData,
+        })
+    }
+
+    /// Current region's `(ctrl_ptr, data_ptr)`, then advances past its `cap`
+    /// ctrl bytes + `cap * slot_size` data bytes.
+    ///
+    /// # Safety
+    /// `base` must point at a [`layout_for`] arena covering every reserved
+    /// region, in order.
+    pub(crate) unsafe fn reserve(
+        &mut self,
+        cap: u32,
+    ) -> Result<(*mut u8, *mut MaybeUninit<T>), TryReserveError> {
+        // Both offsets computed before committing, so overflow leaves the
+        // cursor unchanged.
+        let next_ctrl_off = self
+            .ctrl_off
+            .checked_add(cap)
+            .ok_or(TryReserveError::CapacityOverflow)?;
+        let data_bytes = cap
+            .checked_mul(self.slot_size)
+            .ok_or(TryReserveError::CapacityOverflow)?;
+        let next_data_off = self
+            .data_off
+            .checked_add(data_bytes)
+            .ok_or(TryReserveError::CapacityOverflow)?;
+
+        // SAFETY: offsets stay within the caller's arena layout.
+        let ctrl_ptr = unsafe { self.base.add(self.ctrl_off as usize) };
+        let data_ptr = unsafe {
+            self.base
+                .add(self.data_off as usize)
+                .cast::<MaybeUninit<T>>()
+        };
+        self.ctrl_off = next_ctrl_off;
+        self.data_off = next_data_off;
+        Ok((ctrl_ptr, data_ptr))
+    }
 }
 
 /// O(N²) alias check for [`get_disjoint_mut`]-style APIs: panics if two
