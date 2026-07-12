@@ -1,5 +1,3 @@
-#![allow(clippy::inline_always, clippy::trivially_copy_pass_by_ref)]
-
 use core::hash::{BuildHasher, Hash};
 use core::mem::{self, MaybeUninit};
 use core::ptr;
@@ -28,7 +26,9 @@ use crate::map;
 /// by iterators, the `(level, slot)` location backs removal.
 type ElasticScanItem<K, V> = (*mut SlotEntry<K, V>, (usize, usize));
 
-const ELASTIC_PROBE_SEED: u64 = 0xD1B5_4A32_D192_ED03;
+// Fixed construction seed shared by placement and lookup. The membership path
+// reuses the value under a separate mixer.
+const ELASTIC_PROBE_SEED: u64 = probe::WYHASH_DEFAULT_SECRET[0];
 const ELASTIC_PROBE_BUDGET_C: usize = 8;
 const RANGE_WORD_CAP: u32 = 8;
 const UNIFORM_SEARCH_CAP: u64 = 4_096;
@@ -41,8 +41,12 @@ const MAX_ELASTIC_SLOTS: usize = match 1_usize.checked_shl(u32::BITS) {
 };
 const MEMBERSHIP_BITS_PER_SLOT: usize = 8;
 const MEMBERSHIP_SLOTS_PER_WORD: usize = u64::BITS as usize / MEMBERSHIP_BITS_PER_SLOT;
-const MEMBERSHIP_SALT_1: u64 = 0xA076_1D64_78BD_642F;
-const MEMBERSHIP_SALT_2: u64 = 0xE703_7ED1_A0B4_28DB;
+// The salt uses wyrand's current state increment as a fixed domain separator. The
+// multipliers are SplitMix64's Stafford Mix13 finalizer constants: odd values
+// selected for avalanche quality. These are filter choices, not paper parameters.
+const MEMBERSHIP_SALT: u64 = probe::WYHASH_DEFAULT_SECRET[0];
+const MEMBERSHIP_MIX_MULTIPLIER_1: u64 = 0xBF58_476D_1CE4_E5B9;
+const MEMBERSHIP_MIX_MULTIPLIER_2: u64 = 0x94D0_49BB_1331_11EB;
 const ELASTIC_LEVEL_LANES: [u64; u32::BITS as usize] = elastic_level_lanes();
 const ELASTIC_QUERY_PROBE_LANES: [u64; QUERY_PROBE_LANE_COUNT] = elastic_query_probe_lanes();
 
@@ -335,19 +339,21 @@ fn membership_tail_span<K, V>(total_slots: usize) -> usize {
 #[inline]
 fn membership_mix(hash: u64, salt: u64) -> u64 {
     let mut mixed = hash ^ salt;
-    mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    mixed = (mixed ^ (mixed >> 30)).wrapping_mul(MEMBERSHIP_MIX_MULTIPLIER_1);
+    mixed = (mixed ^ (mixed >> 27)).wrapping_mul(MEMBERSHIP_MIX_MULTIPLIER_2);
     mixed ^ (mixed >> 31)
 }
 
 #[inline]
-fn membership_location(hash: u64, salt: u64, word_count: usize) -> (usize, u64) {
-    let mixed = membership_mix(hash, salt);
+fn membership_location(hash: u64, word_count: usize) -> (usize, u64) {
+    let mixed = membership_mix(hash, MEMBERSHIP_SALT);
     let product =
         u128::from(mixed) * u128::try_from(word_count).expect("usize is representable as u128");
     let word = usize::try_from(product >> 64).expect("multiply-high index is below word count");
-    let bit = 1_u64 << (mixed.rotate_left(17) & 63);
-    (word, bit)
+    let first_shift = mixed & 63;
+    let second_shift = (first_shift + 1 + ((mixed >> 32) & 31)) & 63;
+    let bits = (1_u64 << first_shift) | (1_u64 << second_shift);
+    (word, bits)
 }
 
 fn probe_schedule_capacity(level_count: usize) -> usize {
@@ -728,31 +734,25 @@ where
         }
     }
 
-    #[inline]
+    #[inline(never)]
     fn membership_maybe_contains(&self, hash: u64) -> bool {
         let words = self.membership_words();
         if words == 0 {
             return false;
         }
-        let (first_word, first_bit) = membership_location(hash, MEMBERSHIP_SALT_1, words);
-        let (second_word, second_bit) = membership_location(hash, MEMBERSHIP_SALT_2, words);
-        unsafe {
-            (*self.membership_ptr().add(first_word) & first_bit) != 0
-                && (*self.membership_ptr().add(second_word) & second_bit) != 0
-        }
+        let (word, bits) = membership_location(hash, words);
+        unsafe { *self.membership_ptr().add(word) & bits == bits }
     }
 
-    #[inline]
+    #[inline(never)]
     fn record_membership(&mut self, hash: u64) {
         let words = self.membership_words();
         if words == 0 {
             return;
         }
-        let (first_word, first_bit) = membership_location(hash, MEMBERSHIP_SALT_1, words);
-        let (second_word, second_bit) = membership_location(hash, MEMBERSHIP_SALT_2, words);
+        let (word, bits) = membership_location(hash, words);
         unsafe {
-            *self.membership_ptr().add(first_word) |= first_bit;
-            *self.membership_ptr().add(second_word) |= second_bit;
+            *self.membership_ptr().add(word) |= bits;
         }
     }
 
@@ -1441,7 +1441,7 @@ where
         let (case, level, slot, paper_probe) = match target {
             BatchTarget::Bootstrap => {
                 let level_probe = probe.prepare_level_lane(ELASTIC_LEVEL_LANES[0]);
-                let (slot, paper_probe) = self.uniform_vacancy(&level_probe, 0)?;
+                let (slot, paper_probe) = self.uniform_vacancy(level_probe, 0)?;
                 (
                     ExactInsertionCase::Batch0 { level: 0 },
                     0,
@@ -1463,7 +1463,7 @@ where
 
                 if current_low {
                     let level_probe = probe.prepare_level_lane(ELASTIC_LEVEL_LANES[next]);
-                    let (slot, paper_probe) = self.uniform_vacancy(&level_probe, next)?;
+                    let (slot, paper_probe) = self.uniform_vacancy(level_probe, next)?;
                     (
                         ExactInsertionCase::Case2 {
                             batch: next,
@@ -1478,7 +1478,7 @@ where
                     )
                 } else if next_low {
                     let level_probe = probe.prepare_level_lane(ELASTIC_LEVEL_LANES[current]);
-                    let (slot, paper_probe) = self.uniform_vacancy(&level_probe, current)?;
+                    let (slot, paper_probe) = self.uniform_vacancy(level_probe, current)?;
                     (
                         ExactInsertionCase::Case3 {
                             batch: next,
@@ -1510,13 +1510,13 @@ where
                     let current_probe = probe.prepare_level_lane(ELASTIC_LEVEL_LANES[current]);
                     if let Some((slot, probe)) = (0..budget).find_map(|logical_index| {
                         let logical_index = u64::try_from(logical_index).ok()?;
-                        self.vacancy(current, &current_probe, logical_index)
+                        self.vacancy(current, current_probe, logical_index)
                             .map(|slot| (slot, logical_index + 1))
                     }) {
                         (case, current, slot, probe)
                     } else {
                         let next_probe = probe.prepare_level_lane(ELASTIC_LEVEL_LANES[next]);
-                        let (slot, paper_probe) = self.uniform_vacancy(&next_probe, next)?;
+                        let (slot, paper_probe) = self.uniform_vacancy(next_probe, next)?;
                         (case, next, slot, paper_probe)
                     }
                 }
@@ -1537,7 +1537,7 @@ where
 
     fn uniform_vacancy(
         &self,
-        probe: &PreparedElasticLevelProbe,
+        probe: PreparedElasticLevelProbe,
         level: usize,
     ) -> Option<(usize, u64)> {
         for logical_index in 0..UNIFORM_SEARCH_CAP {
@@ -1551,7 +1551,7 @@ where
     fn vacancy(
         &self,
         level: usize,
-        probe: &PreparedElasticLevelProbe,
+        probe: PreparedElasticLevelProbe,
         logical_index: u64,
     ) -> Option<usize> {
         let slot = self.route_prepared(level, probe, logical_index)?;
@@ -1561,38 +1561,32 @@ where
             .then_some(slot)
     }
 
-    #[cfg(test)]
-    fn route_exact(&self, level: usize, key_hash: u64, logical_index: u64) -> Option<usize> {
-        let probe = CounterPrf::new(ELASTIC_PROBE_SEED).prepare_elastic(key_hash);
-        let level_lane = *ELASTIC_LEVEL_LANES.get(level)?;
-        let level_probe = probe.prepare_level_lane(level_lane);
-        self.route_prepared(level, &level_probe, logical_index)
-    }
-
     fn route_prepared(
         &self,
         level: usize,
-        probe: &PreparedElasticLevelProbe,
+        probe: PreparedElasticLevelProbe,
         logical_index: u64,
     ) -> Option<usize> {
         let logical_probe_lane = PreparedElasticProbe::logical_probe_lane(logical_index);
         self.route_prepared_lane(level, probe, logical_probe_lane)
     }
 
+    #[allow(clippy::inline_always)]
     #[inline(always)]
     fn route_prepared_lane(
         &self,
         level: usize,
-        probe: &PreparedElasticLevelProbe,
+        probe: PreparedElasticLevelProbe,
         logical_probe_lane: u64,
     ) -> Option<usize> {
         let upper = self.levels.get(level)?.capacity();
         Self::route_prepared_lane_for_upper(probe, logical_probe_lane, upper)
     }
 
+    #[allow(clippy::inline_always)]
     #[inline(always)]
     fn route_prepared_lane_for_upper(
-        prepared: &PreparedElasticLevelProbe,
+        prepared: PreparedElasticLevelProbe,
         logical_probe_lane: u64,
         upper: usize,
     ) -> Option<usize> {
@@ -1668,7 +1662,7 @@ where
         let mut prepared_levels = 1_u32;
 
         let Some(h11_slot) = Self::route_prepared_lane_for_upper(
-            &level_zero_probe,
+            level_zero_probe,
             ELASTIC_QUERY_PROBE_LANES[0],
             self.levels[0].capacity(),
         ) else {
@@ -1700,7 +1694,7 @@ where
                 unsafe { *ELASTIC_QUERY_PROBE_LANES.get_unchecked(logical_probe) };
             let upper = route.range_upper as usize;
             let Some(slot) =
-                Self::route_prepared_lane_for_upper(&level_probe, logical_probe_lane, upper)
+                Self::route_prepared_lane_for_upper(level_probe, logical_probe_lane, upper)
             else {
                 return self.find_by_full_scan(key, key_fingerprint, on_hit);
             };
@@ -1769,6 +1763,21 @@ fn first_paper_probe_after(paper_level: u128, position: u128) -> u128 {
         }
     }
     lower
+}
+
+#[cfg(test)]
+impl<K, V, S, A> ElasticTable<K, V, S, A>
+where
+    K: Eq + Hash,
+    S: BuildHasher,
+    A: Allocator + Clone,
+{
+    fn route_exact(&self, level: usize, key_hash: u64, logical_index: u64) -> Option<usize> {
+        let probe = CounterPrf::new(ELASTIC_PROBE_SEED).prepare_elastic(key_hash);
+        let level_lane = *ELASTIC_LEVEL_LANES.get(level)?;
+        let level_probe = probe.prepare_level_lane(level_lane);
+        self.route_prepared(level, level_probe, logical_index)
+    }
 }
 
 #[cfg(test)]
@@ -2226,6 +2235,28 @@ mod tests {
         assert!(map.table().membership_maybe_contains(inserted_hash));
         assert_eq!(map.insert(7, 17), None);
         assert_eq!(map.get(&7), Some(&17));
+    }
+
+    #[test]
+    fn membership_record_sets_two_bits_in_one_word() {
+        let mut table =
+            ElasticTable::<u64, u64, IdentityBuildHasher>::with_capacity_and_reserve_and_hasher_in(
+                1_024,
+                ReserveFraction::DEFAULT,
+                IdentityBuildHasher,
+                Global,
+            );
+
+        table.record_membership(0);
+
+        let membership = unsafe {
+            core::slice::from_raw_parts(table.membership_ptr(), table.membership_words())
+        };
+        assert_eq!(membership.iter().filter(|&&word| word != 0).count(), 1);
+        assert_eq!(
+            membership.iter().map(|word| word.count_ones()).sum::<u32>(),
+            2
+        );
     }
 
     #[test]
