@@ -287,6 +287,13 @@ impl PreparedFastFunnelProbe {
 impl PreparedFastFunnelDomainProbe {
     #[allow(clippy::inline_always)]
     #[inline(always)]
+    fn word_from_indices(self, logical_probe_index: u8, rejection_index: u8) -> u64 {
+        let counter =
+            self.counter_base | (u64::from(logical_probe_index) << 8) | u64::from(rejection_index);
+        mix64(counter ^ self.key_in) ^ self.key_out
+    }
+
+    #[cfg(test)]
     fn word(self, logical_probe_index: u64, rejection_index: u32) -> u64 {
         assert!(
             logical_probe_index < FUNNEL_LOGICAL_LIMIT,
@@ -296,8 +303,10 @@ impl PreparedFastFunnelDomainProbe {
             rejection_index < FUNNEL_REJECTION_LIMIT,
             "Funnel rejection retry exceeds its checked counter encoding"
         );
-        let counter = self.counter_base | (logical_probe_index << 8) | u64::from(rejection_index);
-        mix64(counter ^ self.key_in) ^ self.key_out
+        self.word_from_indices(
+            u8::try_from(logical_probe_index).expect("checked logical probe must fit"),
+            u8::try_from(rejection_index).expect("checked rejection retry must fit"),
+        )
     }
 }
 
@@ -445,7 +454,7 @@ pub(crate) fn unbiased_prepared_elastic_probe_index(
 #[inline(always)]
 pub(crate) fn unbiased_prepared_funnel_probe_index_in_range(
     probe: &PreparedFastFunnelDomainProbe,
-    logical_probe_index: u64,
+    logical_probe_index: u8,
     range: PreparedProbeRange,
     max_random_words: u32,
 ) -> Result<ProbeIndex, RangeReductionError> {
@@ -454,16 +463,22 @@ pub(crate) fn unbiased_prepared_funnel_probe_index_in_range(
             random_word_count: 0,
         });
     }
+    let Ok(last_rejection_index) = u8::try_from(max_random_words - 1) else {
+        return Err(RangeReductionError::RejectionLimitExceeded {
+            random_word_count: 0,
+        });
+    };
 
     let upper_word = range.upper as u64;
-    let product = u128::from(probe.word(logical_probe_index, 0)) * u128::from(upper_word);
+    let product =
+        u128::from(probe.word_from_indices(logical_probe_index, 0)) * u128::from(upper_word);
     if product as u64 >= range.rejection_threshold {
         return Ok(ProbeIndex {
             index: (product >> u64::BITS) as usize,
             random_word_count: 1,
         });
     }
-    reduce_prepared_funnel_retries(probe, logical_probe_index, range, max_random_words)
+    reduce_prepared_funnel_retries(probe, logical_probe_index, range, last_rejection_index)
 }
 
 #[cold]
@@ -471,23 +486,23 @@ pub(crate) fn unbiased_prepared_funnel_probe_index_in_range(
 #[allow(clippy::cast_possible_truncation)]
 fn reduce_prepared_funnel_retries(
     probe: &PreparedFastFunnelDomainProbe,
-    logical_probe_index: u64,
+    logical_probe_index: u8,
     range: PreparedProbeRange,
-    max_random_words: u32,
+    last_rejection_index: u8,
 ) -> Result<ProbeIndex, RangeReductionError> {
     let upper_word = range.upper as u64;
-    for rejection_index in 1..max_random_words {
-        let product =
-            u128::from(probe.word(logical_probe_index, rejection_index)) * u128::from(upper_word);
+    for rejection_index in 1..=last_rejection_index {
+        let product = u128::from(probe.word_from_indices(logical_probe_index, rejection_index))
+            * u128::from(upper_word);
         if product as u64 >= range.rejection_threshold {
             return Ok(ProbeIndex {
                 index: (product >> u64::BITS) as usize,
-                random_word_count: rejection_index + 1,
+                random_word_count: u32::from(rejection_index) + 1,
             });
         }
     }
     Err(RangeReductionError::RejectionLimitExceeded {
-        random_word_count: max_random_words,
+        random_word_count: u32::from(last_rejection_index) + 1,
     })
 }
 
@@ -847,6 +862,21 @@ mod tests {
     }
 
     #[test]
+    fn fast_funnel_narrow_indices_match_checked_counter_encoding() {
+        let oracle = FunnelPrf::new(0x1234_5678_9abc_def0);
+        let key = 0xd1b5_4a32_d192_ed03;
+        let domain = ProbeDomain::FunnelSpecialPrimary;
+        let prepared = oracle.prepare(key).prepare_domain(domain).unwrap();
+
+        for (logical, rejection) in [(0_u8, 0_u8), (u8::MAX, u8::MAX)] {
+            assert_eq!(
+                prepared.word_from_indices(logical, rejection),
+                oracle.word(key, domain, u64::from(logical), u32::from(rejection))
+            );
+        }
+    }
+
+    #[test]
     fn fast_funnel_prepared_words_and_reductions_match_the_generic_oracle() {
         let oracle = FunnelPrf::new(0x1234_5678_9abc_def0);
         for key in [0, 1, u64::MAX, 0xd1b5_4a32_d192_ed03] {
@@ -859,11 +889,11 @@ mod tests {
                 ProbeDomain::FunnelSpecialFallbackChoiceB,
             ] {
                 let prepared_domain = prepared.prepare_domain(domain).unwrap();
-                for logical in [0, 1, 7, 255] {
-                    for retry in [0, 1, 7, 255] {
+                for logical in [0_u8, 1, 7, u8::MAX] {
+                    for retry in [0_u8, 1, 7, u8::MAX] {
                         assert_eq!(
-                            prepared_domain.word(logical, retry),
-                            oracle.word(key, domain, logical, retry)
+                            prepared_domain.word(u64::from(logical), u32::from(retry)),
+                            oracle.word(key, domain, u64::from(logical), u32::from(retry))
                         );
                     }
                     for upper in [1, 2, 3, 16, 191, 1_237, 1 << 20] {
@@ -875,7 +905,14 @@ mod tests {
                                 range,
                                 8,
                             ),
-                            unbiased_probe_index(&oracle, key, domain, logical, upper, 8)
+                            unbiased_probe_index(
+                                &oracle,
+                                key,
+                                domain,
+                                u64::from(logical),
+                                upper,
+                                8,
+                            )
                         );
                     }
                 }
@@ -992,6 +1029,70 @@ mod tests {
             unbiased_prepared_funnel_probe_index_in_range(&exhausted, 9, range, 3),
             Err(RangeReductionError::RejectionLimitExceeded {
                 random_word_count: 3
+            })
+        );
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn fast_funnel_reducer_accepts_the_full_rejection_index_lane() {
+        const KEY: u64 = 0x105;
+        const LOGICAL_PROBE_INDEX: u8 = u8::MAX;
+        const UPPER: usize = 2;
+        const REJECTION_THRESHOLD: u64 = 0xff84_5d7d_b7be_f760;
+        let prepared = FunnelPrf::new(0x1234_5678_9abc_def0)
+            .prepare(KEY)
+            .prepare_domain(ProbeDomain::FunnelSpecialPrimary)
+            .unwrap();
+        let upper_word = u64::try_from(UPPER).unwrap();
+
+        for rejection_index in 0..u8::MAX {
+            let product =
+                u128::from(prepared.word_from_indices(LOGICAL_PROBE_INDEX, rejection_index))
+                    * u128::from(upper_word);
+            assert!(
+                (product as u64) < REJECTION_THRESHOLD,
+                "rejection index {rejection_index} must reject"
+            );
+        }
+        let endpoint_product = u128::from(prepared.word_from_indices(LOGICAL_PROBE_INDEX, u8::MAX))
+            * u128::from(upper_word);
+        assert!((endpoint_product as u64) >= REJECTION_THRESHOLD);
+        let expected_index = usize::try_from(endpoint_product >> u64::BITS).unwrap();
+
+        assert_eq!(
+            unbiased_prepared_funnel_probe_index_in_range(
+                &prepared,
+                LOGICAL_PROBE_INDEX,
+                PreparedProbeRange {
+                    upper: UPPER,
+                    rejection_threshold: REJECTION_THRESHOLD,
+                },
+                256,
+            ),
+            Ok(ProbeIndex {
+                index: expected_index,
+                random_word_count: 256
+            })
+        );
+    }
+
+    #[test]
+    fn fast_funnel_reducer_rejects_counts_above_its_counter_encoding() {
+        let prepared = FunnelPrf::new(0x1234_5678_9abc_def0)
+            .prepare(0xd1b5_4a32_d192_ed03)
+            .prepare_domain(ProbeDomain::FunnelSpecialPrimary)
+            .unwrap();
+
+        assert_eq!(
+            unbiased_prepared_funnel_probe_index_in_range(
+                &prepared,
+                0,
+                PreparedProbeRange::new(2).unwrap(),
+                257,
+            ),
+            Err(RangeReductionError::RejectionLimitExceeded {
+                random_word_count: 0
             })
         );
     }

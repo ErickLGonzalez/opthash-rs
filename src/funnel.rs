@@ -61,6 +61,18 @@ impl FunnelShape {
         }
     }
 
+    #[inline]
+    fn encode_logical_probe(&self, logical_probe: usize) -> u8 {
+        debug_assert!(logical_probe < self.loglog_ceiling);
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "shape construction validates the counter lane"
+        )]
+        {
+            logical_probe as u8
+        }
+    }
+
     fn from_slots(n: usize, reserve: ReserveFraction) -> Result<Self, TryReserveError> {
         if n == 0 {
             return Ok(Self::empty());
@@ -106,12 +118,14 @@ impl FunnelShape {
         {
             return Err(TryReserveError::CapacityOverflow);
         }
+        let loglog_ceiling =
+            u8::try_from(plan.loglog_ceiling()).map_err(|_| TryReserveError::CapacityOverflow)?;
         Ok(Self {
             n,
             max_insertions: config.target_insertions(),
             levels: levels.into_boxed_slice(),
             beta: plan.beta(),
-            loglog_ceiling: plan.loglog_ceiling(),
+            loglog_ceiling: usize::from(loglog_ceiling),
             primary_offset,
             primary_range,
             fallback_offset,
@@ -447,7 +461,7 @@ where
     #[inline]
     fn sample(
         prepared: &PreparedFastFunnelDomainProbe,
-        logical_probe: u64,
+        logical_probe: u8,
         range: PreparedProbeRange,
     ) -> Option<usize> {
         probe::unbiased_prepared_funnel_probe_index_in_range(
@@ -560,7 +574,7 @@ where
         for logical_probe in 0..self.shape.loglog_ceiling {
             let Some(local) = Self::sample(
                 &primary_probe,
-                logical_probe as u64,
+                self.shape.encode_logical_probe(logical_probe),
                 self.shape.primary_range,
             ) else {
                 return SearchResult::RangeFailure;
@@ -1387,7 +1401,7 @@ mod tests {
             let local = sample(
                 identity,
                 ProbeDomain::FunnelSpecialPrimary,
-                logical as u64,
+                u64::try_from(logical).unwrap(),
                 table.shape.primary_range.upper(),
             );
             let slot = table.shape.primary_offset + local;

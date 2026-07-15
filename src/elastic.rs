@@ -39,8 +39,7 @@ const MAX_ELASTIC_SLOTS: usize = match 1_usize.checked_shl(u32::BITS) {
     Some(slots) => slots,
     None => usize::MAX,
 };
-const MEMBERSHIP_BITS_PER_SLOT: usize = 8;
-const MEMBERSHIP_SLOTS_PER_WORD: usize = u64::BITS as usize / MEMBERSHIP_BITS_PER_SLOT;
+const MEMBERSHIP_SLOTS_PER_WORD: usize = 10;
 // The salt uses wyrand's current state increment as a fixed domain separator. The
 // multipliers are SplitMix64's Stafford Mix13 finalizer constants: odd values
 // selected for avalanche quality. These are filter choices, not paper parameters.
@@ -344,16 +343,36 @@ fn membership_mix(hash: u64, salt: u64) -> u64 {
     mixed ^ (mixed >> 31)
 }
 
-#[inline]
-fn membership_location(hash: u64, word_count: usize) -> (usize, u64) {
-    let mixed = membership_mix(hash, MEMBERSHIP_SALT);
-    let product =
-        u128::from(mixed) * u128::try_from(word_count).expect("usize is representable as u128");
-    let word = usize::try_from(product >> 64).expect("multiply-high index is below word count");
-    let first_shift = mixed & 63;
-    let second_shift = (first_shift + 1 + ((mixed >> 32) & 31)) & 63;
-    let bits = (1_u64 << first_shift) | (1_u64 << second_shift);
-    (word, bits)
+#[derive(Clone, Copy)]
+struct PreparedMembership {
+    mixed: u64,
+    bits: u64,
+}
+
+impl PreparedMembership {
+    #[inline]
+    fn new(hash: u64) -> Self {
+        let mixed = membership_mix(hash, MEMBERSHIP_SALT);
+        let first_shift = mixed & 63;
+        let step = ((mixed >> 32) | 1) & 63;
+        let second_shift = first_shift.wrapping_add(step) & 63;
+        let third_shift = second_shift.wrapping_add(step) & 63;
+        let fourth_shift = third_shift.wrapping_add(step) & 63;
+        Self {
+            mixed,
+            bits: (1_u64 << first_shift)
+                | (1_u64 << second_shift)
+                | (1_u64 << third_shift)
+                | (1_u64 << fourth_shift),
+        }
+    }
+
+    #[inline]
+    fn word(self, word_count: usize) -> usize {
+        let product = u128::from(self.mixed)
+            * u128::try_from(word_count).expect("usize is representable as u128");
+        usize::try_from(product >> 64).expect("multiply-high index is below word count")
+    }
 }
 
 fn probe_schedule_capacity(level_count: usize) -> usize {
@@ -733,24 +752,21 @@ where
     }
 
     #[inline(never)]
-    fn membership_maybe_contains(&self, hash: u64) -> bool {
+    fn membership_maybe_contains(&self, prepared: PreparedMembership) -> bool {
         let words = self.membership_words();
         if words == 0 {
             return false;
         }
-        let (word, bits) = membership_location(hash, words);
-        unsafe { *self.membership_ptr().add(word) & bits == bits }
+        unsafe { *self.membership_ptr().add(prepared.word(words)) & prepared.bits == prepared.bits }
     }
 
     #[inline(never)]
-    fn record_membership(&mut self, hash: u64) {
+    fn record_membership(&mut self, prepared: PreparedMembership) {
         let words = self.membership_words();
-        if words == 0 {
-            return;
-        }
-        let (word, bits) = membership_location(hash, words);
-        unsafe {
-            *self.membership_ptr().add(word) |= bits;
+        if words != 0 {
+            unsafe {
+                *self.membership_ptr().add(prepared.word(words)) |= prepared.bits;
+            }
         }
     }
 
@@ -790,6 +806,17 @@ where
     /// Post-lookup insert for a key known to be absent. Returns the chosen
     /// slot so the caller can borrow into it without re-probing.
     fn insert_for_vacant_entry(&mut self, key: K, value: V, key_hash: u64) -> (usize, usize) {
+        let membership = PreparedMembership::new(key_hash);
+        self.insert_for_vacant_entry_prepared(key, value, key_hash, membership)
+    }
+
+    fn insert_for_vacant_entry_prepared(
+        &mut self,
+        key: K,
+        value: V,
+        key_hash: u64,
+        membership: PreparedMembership,
+    ) -> (usize, usize) {
         let key_fingerprint = control::control_fingerprint(key_hash);
 
         match self
@@ -804,15 +831,15 @@ where
         }
 
         if let Some(placement) = self.choose_slot_for_new_key(key_hash, self.scheduler.target()) {
-            return self.place_new_entry(key, value, key_hash, key_fingerprint, placement);
+            return self.place_new_entry(key, value, membership, key_fingerprint, placement);
         }
 
         self.resize_with_transition(self.total_slots, EpochTransition::PlacementRecovery);
         self.scheduler.advance_batch_window();
         if let Some(placement) = self.choose_slot_for_new_key(key_hash, self.scheduler.target()) {
-            self.place_new_entry(key, value, key_hash, key_fingerprint, placement)
+            self.place_new_entry(key, value, membership, key_fingerprint, placement)
         } else {
-            self.place_exceptional_entry(key, value, key_hash, key_fingerprint)
+            self.place_exceptional_entry(key, value, membership, key_fingerprint)
         }
     }
 
@@ -822,7 +849,7 @@ where
         &mut self,
         key: K,
         value: V,
-        key_hash: u64,
+        membership: PreparedMembership,
         key_fingerprint: u8,
         placement: ExactPlacement,
     ) -> (usize, usize) {
@@ -830,7 +857,7 @@ where
         self.write_new_entry(
             key,
             value,
-            key_hash,
+            membership,
             key_fingerprint,
             placement.level,
             placement.slot,
@@ -842,14 +869,14 @@ where
         &mut self,
         key: K,
         value: V,
-        key_hash: u64,
+        membership: PreparedMembership,
         key_fingerprint: u8,
     ) -> (usize, usize) {
         let (level, slot) = self
             .first_free_slot()
             .expect("Elastic insertion limit must leave a free slot");
         self.probe_high_water |= EXCEPTIONAL_PLACEMENT_FLAG;
-        self.write_new_entry(key, value, key_hash, key_fingerprint, level, slot)
+        self.write_new_entry(key, value, membership, key_fingerprint, level, slot)
     }
 
     fn first_free_slot(&self) -> Option<(usize, usize)> {
@@ -868,7 +895,7 @@ where
         &mut self,
         key: K,
         value: V,
-        key_hash: u64,
+        membership: PreparedMembership,
         key_fingerprint: u8,
         level_idx: usize,
         slot_idx: usize,
@@ -882,7 +909,7 @@ where
                 level.tombstones -= 1;
             }
         }
-        self.record_membership(key_hash);
+        self.record_membership(membership);
         self.len += 1;
         self.scheduler.complete_insert();
         (level_idx, slot_idx)
@@ -1082,13 +1109,14 @@ where
     where
         K: Hash + Eq,
     {
-        if self.membership_maybe_contains(hash) {
+        let membership = PreparedMembership::new(hash);
+        if self.membership_maybe_contains(membership) {
             let fingerprint = control::control_fingerprint(hash);
             if let Some(location) = self.find_slot_indices_with_hash(&key, hash, fingerprint) {
                 return Some(self.replace_value(location, value));
             }
         }
-        self.insert_for_vacant_entry(key, value, hash);
+        self.insert_for_vacant_entry_prepared(key, value, hash, membership);
         None
     }
 
@@ -1277,15 +1305,16 @@ where
     #[inline]
     fn insert_unique(&mut self, key: K, value: V) -> bool {
         let key_hash = self.hash_key(&key);
+        let membership = PreparedMembership::new(key_hash);
         let key_fingerprint = control::control_fingerprint(key_hash);
 
         self.scheduler.advance_batch_window();
         let target = self.scheduler.target();
         if let Some(placement) = self.choose_slot_for_new_key(key_hash, target) {
-            self.place_new_entry(key, value, key_hash, key_fingerprint, placement);
+            self.place_new_entry(key, value, membership, key_fingerprint, placement);
             false
         } else {
-            self.place_exceptional_entry(key, value, key_hash, key_fingerprint);
+            self.place_exceptional_entry(key, value, membership, key_fingerprint);
             true
         }
     }
@@ -1976,7 +2005,13 @@ mod tests {
 
             let fingerprint = control::control_fingerprint(identity);
             assert_eq!(
-                table.place_new_entry(identity, identity, identity, fingerprint, placement),
+                table.place_new_entry(
+                    identity,
+                    identity,
+                    PreparedMembership::new(identity),
+                    fingerprint,
+                    placement,
+                ),
                 (placement.level, placement.slot)
             );
             assert_eq!(
@@ -2217,41 +2252,52 @@ mod tests {
         let mut map: ElasticHashMap<u64, u64, IdentityBuildHasher> =
             ElasticHashMap::with_capacity_and_hasher(64, IdentityBuildHasher);
         let inserted_hash = map.table().hash_key(&7_u64);
-        assert!(!map.table().membership_maybe_contains(inserted_hash));
+        let membership = PreparedMembership::new(inserted_hash);
+        assert!(!map.table().membership_maybe_contains(membership));
 
         assert_eq!(map.insert(7, 11), None);
-        assert!(map.table().membership_maybe_contains(inserted_hash));
+        assert!(map.table().membership_maybe_contains(membership));
 
         assert_eq!(map.insert(7, 13), Some(11));
         assert_eq!(map.len(), 1);
-        assert!(map.table().membership_maybe_contains(inserted_hash));
+        assert!(map.table().membership_maybe_contains(membership));
 
         assert_eq!(map.remove(&7), Some(13));
-        assert!(map.table().membership_maybe_contains(inserted_hash));
+        assert!(map.table().membership_maybe_contains(membership));
         assert_eq!(map.insert(7, 17), None);
         assert_eq!(map.get(&7), Some(&17));
     }
 
     #[test]
-    fn membership_record_sets_two_bits_in_one_word() {
-        let mut table =
-            ElasticTable::<u64, u64, IdentityBuildHasher>::with_capacity_and_reserve_and_hasher_in(
-                1_024,
-                ReserveFraction::DEFAULT,
-                IdentityBuildHasher,
-                Global,
+    fn blocked_membership_never_forgets_inserted_hashes() {
+        let mut map: ElasticHashMap<u64, u64, IdentityBuildHasher> =
+            ElasticHashMap::with_capacity_and_hasher(2_048, IdentityBuildHasher);
+        for key in 0..1_024_u64 {
+            map.insert(key, key);
+        }
+        for key in 0..1_024_u64 {
+            assert!(
+                map.table()
+                    .membership_maybe_contains(PreparedMembership::new(key))
             );
+        }
+    }
 
-        table.record_membership(0);
+    #[test]
+    fn prepared_membership_remains_valid_across_growth() {
+        let key = 0xD1B5_4A32_D192_ED03_u64;
+        let prepared = PreparedMembership::new(key);
+        let mut map: ElasticHashMap<u64, u64, IdentityBuildHasher> =
+            ElasticHashMap::with_capacity_and_hasher(1, IdentityBuildHasher);
 
-        let membership = unsafe {
-            core::slice::from_raw_parts(table.membership_ptr(), table.membership_words())
-        };
-        assert_eq!(membership.iter().filter(|&&word| word != 0).count(), 1);
-        assert_eq!(
-            membership.iter().map(|word| word.count_ones()).sum::<u32>(),
-            2
-        );
+        map.insert(key, 7);
+        assert!(map.table().membership_maybe_contains(prepared));
+        let old_slots = map.table().total_slots;
+
+        map.reserve(1_024);
+        assert!(map.table().total_slots > old_slots);
+        assert!(map.table().membership_maybe_contains(prepared));
+        assert_eq!(map.get(&key), Some(&7));
     }
 
     #[test]
@@ -2265,14 +2311,22 @@ mod tests {
         let mut cloned = map.clone();
         for key in 0_u64..96 {
             let hash = cloned.table().hash_key(&key);
-            assert!(cloned.table().membership_maybe_contains(hash));
+            assert!(
+                cloned
+                    .table()
+                    .membership_maybe_contains(PreparedMembership::new(hash))
+            );
             assert_eq!(cloned.get(&key), Some(&(key ^ 0x55)));
         }
 
         cloned.clear();
         for key in 0_u64..96 {
             let hash = cloned.table().hash_key(&key);
-            assert!(!cloned.table().membership_maybe_contains(hash));
+            assert!(
+                !cloned
+                    .table()
+                    .membership_maybe_contains(PreparedMembership::new(hash))
+            );
         }
 
         for key in 256_u64..384 {
@@ -2281,7 +2335,11 @@ mod tests {
         cloned.reserve(512);
         for key in 256_u64..384 {
             let hash = cloned.table().hash_key(&key);
-            assert!(cloned.table().membership_maybe_contains(hash));
+            assert!(
+                cloned
+                    .table()
+                    .membership_maybe_contains(PreparedMembership::new(hash))
+            );
             assert_eq!(cloned.get(&key), Some(&key));
         }
     }
@@ -2297,7 +2355,10 @@ mod tests {
 
         for key in [11_u64, 22, 33] {
             let hash = map.table().hash_key(&key);
-            assert!(map.table().membership_maybe_contains(hash));
+            assert!(
+                map.table()
+                    .membership_maybe_contains(PreparedMembership::new(hash))
+            );
             assert!(map.contains_key(&key));
         }
     }
@@ -2312,7 +2373,10 @@ mod tests {
         assert!(map.try_reserve(usize::MAX).is_err());
         for key in 0_u64..64 {
             let hash = map.table().hash_key(&key);
-            assert!(map.table().membership_maybe_contains(hash));
+            assert!(
+                map.table()
+                    .membership_maybe_contains(PreparedMembership::new(hash))
+            );
             assert_eq!(map.get(&key), Some(&key));
         }
 
@@ -2320,7 +2384,10 @@ mod tests {
         assert!(map.is_empty());
         for key in 0_u64..64 {
             let hash = map.table().hash_key(&key);
-            assert!(!map.table().membership_maybe_contains(hash));
+            assert!(
+                !map.table()
+                    .membership_maybe_contains(PreparedMembership::new(hash))
+            );
         }
     }
 
@@ -2356,7 +2423,10 @@ mod tests {
         assert_eq!(map.try_reserve(4_096), Err(TryReserveError::AllocError));
         for key in 0_u64..64 {
             let hash = map.table().hash_key(&key);
-            assert!(map.table().membership_maybe_contains(hash));
+            assert!(
+                map.table()
+                    .membership_maybe_contains(PreparedMembership::new(hash))
+            );
             assert_eq!(map.get(&key), Some(&(key ^ 0x5a)));
         }
     }
@@ -2426,7 +2496,7 @@ mod tests {
         assert_eq!(after.placement_recoveries, before.placement_recoveries + 1);
         assert_eq!(after.transition, EpochTransition::PlacementRecovery);
         assert_ne!(table.probe_high_water & EXCEPTIONAL_PLACEMENT_FLAG, 0);
-        assert!(table.membership_maybe_contains(0));
+        assert!(table.membership_maybe_contains(PreparedMembership::new(0)));
         assert_eq!(
             table.find_slot_indices_with_hash(&u64::MAX, 0, fingerprint),
             Some(location)
