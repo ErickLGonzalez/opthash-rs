@@ -158,7 +158,7 @@ impl FunnelPrf {
     pub(crate) fn prepare(self, key_hash: u64) -> PreparedFastFunnelProbe {
         let keyed = key_hash.wrapping_add(self.seed);
         PreparedFastFunnelProbe {
-            key_in: mix64(keyed.wrapping_add(KEY_LANE)),
+            key_in: keyed.wrapping_add(KEY_LANE),
             key_out: mix64(keyed.wrapping_add(DOMAIN_KIND_LANE)),
         }
     }
@@ -985,7 +985,7 @@ mod tests {
                 0,
                 0,
                 0x0000_0000_0000_0000,
-                0x0104_24b6_88a0_31f9,
+                0x0ef8_0bc3_2b4b_4b8b,
             ),
             (
                 1,
@@ -995,7 +995,7 @@ mod tests {
                 255,
                 255,
                 0x3fff_ffff_ffff_ffff,
-                0x18ff_a236_490d_cfe7,
+                0xe12e_db4c_7253_f889,
             ),
             (
                 u64::MAX,
@@ -1003,7 +1003,7 @@ mod tests {
                 255,
                 255,
                 0x4000_0000_0000_ffff,
-                0x459b_2025_172f_a8b0,
+                0x0381_edbb_81aa_baf9,
             ),
             (
                 0xd1b5_4a32_d192_ed03,
@@ -1011,7 +1011,7 @@ mod tests {
                 7,
                 1,
                 0x8000_0000_0000_0701,
-                0x7e31_645c_eb87_f9f4,
+                0xaae3_de68_9f97_85e8,
             ),
             (
                 0x0123_4567_89ab_cdef,
@@ -1019,7 +1019,7 @@ mod tests {
                 0,
                 0,
                 0xc000_0000_0000_0000,
-                0xa73b_4f56_b7b9_6d11,
+                0xf046_a747_c536_c435,
             ),
         ];
         for (key, domain, logical, retry, counter, word) in cases {
@@ -1091,10 +1091,10 @@ mod tests {
     #[test]
     #[allow(clippy::cast_possible_truncation)]
     fn fast_funnel_reducer_accepts_the_full_rejection_index_lane() {
-        const KEY: u64 = 0x105;
+        const KEY: u64 = 0x55;
         const LOGICAL_PROBE_INDEX: u8 = u8::MAX;
         const UPPER: usize = 2;
-        const REJECTION_THRESHOLD: u64 = 0xff84_5d7d_b7be_f760;
+        const REJECTION_THRESHOLD: u64 = 0xfef8_8af3_37e1_1307;
         let prepared = FunnelPrf::new(0x1234_5678_9abc_def0)
             .prepare(KEY)
             .prepare_domain(ProbeDomain::FunnelSpecialPrimary)
