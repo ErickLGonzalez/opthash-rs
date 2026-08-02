@@ -12,7 +12,6 @@ import pytest
 
 import opthash
 
-
 N = 20_000
 TINY_N = 32
 TINY_QUERIES = 20_000
@@ -21,7 +20,7 @@ SEED = 42
 
 
 def _factory_dict(_n: int):
-    return dict()
+    return {}
 
 
 def _factory_elastic(n: int):

@@ -44,6 +44,10 @@ def make_loaded(cls, keys):
     return m
 
 
+def insert_str_keys(m):
+    return [m.__setitem__(k, 0) for k in KEYS_STR]
+
+
 def main():
     print(f"=== str keys, N={N} ===")
     keys = KEYS_STR
@@ -75,21 +79,14 @@ def main():
     bench("funnel m[k]", lambda: [f[k] for k in keys])
 
     print(f"\n=== insert breakdown, str keys, N={N} ===")
-    bench(
-        "dict insert",
-        lambda: (lambda dd: [dd.__setitem__(k, 0) for k in KEYS_STR])(dict()),
-    )
+    bench("dict insert", lambda: insert_str_keys({}))
     bench(
         "elastic insert (capacity=N)",
-        lambda: (lambda mm: [mm.__setitem__(k, 0) for k in KEYS_STR])(
-            opthash.ElasticHashMap(capacity=N)
-        ),
+        lambda: insert_str_keys(opthash.ElasticHashMap(capacity=N)),
     )
     bench(
         "funnel insert (capacity=N)",
-        lambda: (lambda mm: [mm.__setitem__(k, 0) for k in KEYS_STR])(
-            opthash.FunnelHashMap(capacity=N)
-        ),
+        lambda: insert_str_keys(opthash.FunnelHashMap(capacity=N)),
     )
 
     print(f"\n=== get_miss str keys, N={N} ===")
